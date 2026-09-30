@@ -51,6 +51,7 @@ Termux commands: `/help`, `/search words`, `/clear`, `/speak`, `/exit`. `/speak`
 - `No such file or directory`: download from the GitHub URL above first, or check the filename with `ls ~/zia-ai-agent`.
 - `HTTP 401`: the API key is missing, mistyped, revoked, or is the website passphrase instead of a project API key. Create a new key in the control room.
 - `HTTP 403`: check whether web search is enabled if using `/search`; project keys cannot access control-room settings.
+- `HTTP 403 Error 1010`: replace the old client with the current GitHub version using the download command above. The current client identifies itself as `ZiaTermuxClient/1.0`; it does not impersonate a browser.
 - `Could not reach the Worker`: check the exact HTTPS Worker URL and the phone's internet connection.
 - `No mirror selected`: run `termux-change-repo`, select a reachable mirror, then retry `pkg update -y`.
 

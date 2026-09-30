@@ -27,7 +27,11 @@ class ApiError(RuntimeError):
 
 def request_json(url, token, payload=None, timeout=40):
     body = None if payload is None else json.dumps(payload).encode("utf-8")
-    headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
+    headers = {
+        "Authorization": "Bearer " + token,
+        "Accept": "application/json",
+        "User-Agent": "ZiaWhatsAppBridge/1.0 (+https://github.com/ziakhalid236/zia-ai-agent)",
+    }
     if body is not None:
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=body, headers=headers, method="GET" if body is None else "POST")

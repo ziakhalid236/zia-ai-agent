@@ -83,6 +83,14 @@ python termux_agent.py
 
 `termux-setup-storage` صرف تب درکار ہے جب فائل Android کے Downloads فولڈر سے کھولنی ہو۔ اسے اکیلا چلائیں، `Do you want to continue? (y/n)` پر `y` لکھ کر Enter دبائیں اور Android کی اجازت دیں۔ اسے دوسری کمانڈز کے ساتھ ایک ساتھ paste نہ کریں؛ `y/n` prompt اگلی کمانڈ کو جواب سمجھ سکتا ہے۔ GitHub والا طریقہ storage permission سے بچاتا ہے۔
 
+اگر پرانی client پر Cloudflare کا `HTTP 403 Error 1010` آئے تو تازہ client download کرکے دوبارہ چلائیں؛ نئی client واضح `ZiaTermuxClient/1.0` شناخت بھیجتی ہے:
+
+```sh
+cd ~/zia-ai-agent
+curl -fL "https://raw.githubusercontent.com/ziakhalid236/zia-ai-agent/main/termux_agent.py" -o termux_agent.py
+python termux_agent.py
+```
+
 ہر تجویز کردہ shell command غور سے دیکھیں۔ منظور کی گئی کمانڈ Termux کی ایپ اجازتوں کے ساتھ چلتی ہے، اس لیے یہ مکمل sandbox نہیں۔ چیٹ کی عارضی history ایجنٹ بند ہونے پر ختم ہوتی ہے۔
 
 کمانڈز: `/help`, `/search الفاظ`, `/clear`, `/speak`, `/exit`۔ `/speak` Termux:API کے ذریعے صرف جواب بلند آواز سے پڑھتا ہے؛ بول کر input ویب control room میں دستیاب ہے۔

@@ -61,7 +61,11 @@ def ask_base_url(settings):
 
 def request_json(url, api_key, payload=None, timeout=240):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
-    headers = {"Authorization": "Bearer " + api_key, "Accept": "application/json"}
+    headers = {
+        "Authorization": "Bearer " + api_key,
+        "Accept": "application/json",
+        "User-Agent": "ZiaTermuxClient/1.0 (+https://github.com/ziakhalid236/zia-ai-agent)",
+    }
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method="GET" if data is None else "POST")
