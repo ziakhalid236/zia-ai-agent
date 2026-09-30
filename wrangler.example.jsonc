@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "zia-ai-agent",
+  "main": "worker-zia.js",
+  "compatibility_date": "2026-09-30",
+  "ai": { "binding": "AI" },
+  "triggers": { "crons": ["*/1 * * * *"] },
+  "kv_namespaces": [
+    { "binding": "CONFIG", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+  ]
+}

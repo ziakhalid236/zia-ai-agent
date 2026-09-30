@@ -1,0 +1,18 @@
+# Local and account-specific configuration
+wrangler.jsonc
+.dev.vars
+.env
+.env.*
+!.env.example
+
+# Tooling and generated files
+.wrangler/
+node_modules/
+__pycache__/
+*.py[cod]
+*.log
+
+# Credential and private-key files
+*.pem
+*.key
+secrets.*
