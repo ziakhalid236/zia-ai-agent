@@ -404,6 +404,42 @@ function stripMarkdownHeadingMarkers(text) {
   ).join("");
 }
 
+function extractModelText(result) {
+  let content = typeof result === "string" ? result : result && typeof result.response === "string" ? result.response : "";
+  if (!content && result && Array.isArray(result.choices)) {
+    const message = result.choices[0] && result.choices[0].message;
+    if (message && typeof message.content === "string") content = message.content;
+  }
+  if (!content && result && typeof result.output_text === "string") content = result.output_text;
+  if (Array.isArray(content)) content = content.map((part) => typeof part === "string" ? part : part && typeof part.text === "string" ? part.text : "").join("");
+  if (typeof content !== "string") return "";
+  const answer = content.trim();
+  return /^(?:null|undefined|\[object object\])[.!?]*$/i.test(answer) ? "" : answer;
+}
+
+async function runTextModel(env, model, input) {
+  let result = await env.AI.run(model, input);
+  let content = extractModelText(result);
+  if (content) return { result, content };
+
+  const messages = input.messages.map((item) => item && typeof item === "object" ? { ...item } : item);
+  const systemIndex = messages.findIndex((item) => item && item.role === "system");
+  const retryInstruction = "If the previous response was empty or invalid, answer the latest user message with plain text. Do not return JSON, null, or an empty response.";
+  if (systemIndex >= 0) messages[systemIndex].content += "\n\n" + retryInstruction;
+  else messages.unshift({ role: "system", content: retryInstruction });
+  result = await env.AI.run(model, { ...input, messages });
+  content = extractModelText(result);
+  return { result, content };
+}
+
+function modelFallback(messages) {
+  const latest = [...messages].reverse().find((item) => item && item.role === "user");
+  const text = latest && typeof latest.content === "string" ? latest.content : "";
+  return /[\u0600-\u06FF]/.test(text)
+    ? "ارے، ابھی میرا جواب بن نہیں پایا۔ ایک بار پھر کہو، میں کوشش کرتی ہوں۔"
+    : "Sorry, I hit a small hiccup. Could you say that again?";
+}
+
 function whatsappText(message) {
   const value = message && message.text;
   const media = message && (message.image || message.document || message.video || message.audio);
@@ -583,8 +619,8 @@ async function generateWhatsAppReply(history, config, env, sources = []) {
     : "\nGitHub actions are not configured in this WhatsApp bridge.";
   let system = "Assistant name: " + config.assistant_name + ".\nOperator-defined behavior:\n" + config.instructions + "\n\n" + WHATSAPP_PERSONA + toolPolicy + githubPolicy + RESPONSE_STYLE + "\n\n" + FIXED_GUARD;
   if (sources.length) system += "\n\n" + researchPrompt(sources);
-  const result = await env.AI.run(config.model, { messages: [{ role: "system", content: system }].concat(history), temperature: sources.length ? config.temperature : Math.max(config.temperature, 0.6), max_tokens: sources.length ? config.max_tokens : Math.min(config.max_tokens, 260) });
-  let answer = typeof result.response === "string" ? result.response : result.choices && result.choices[0] && result.choices[0].message ? result.choices[0].message.content : JSON.stringify(result);
+  const generated = await runTextModel(env, config.model, { messages: [{ role: "system", content: system }].concat(history), temperature: sources.length ? config.temperature : Math.max(config.temperature, 0.6), max_tokens: sources.length ? config.max_tokens : Math.min(config.max_tokens, 260) });
+  let answer = generated.content || modelFallback(history);
   answer = stripMarkdownHeadingMarkers(answer);
   if (!config.shell_suggestions_enabled) answer = answer.replace(/```(?:termux|bash|sh|shell)\s*\n[\s\S]*?```/gi, "[Shell command suggestions are disabled by the operator.]");
   return answer.slice(0, 4096);
@@ -1062,12 +1098,12 @@ export default {
           const toolPolicy = "\n\nEnabled tools: the chat can read public HTTPS pages and search the public web when the user asks for research or shares a link; web search is " + (config.web_search_enabled ? "enabled" : "disabled") + "; shell command suggestions are " + (config.shell_suggestions_enabled ? "allowed as unexecuted proposals" : "disabled");
           const sourceContext = sources.length ? "\n\n" + researchPrompt(sources) : "";
           const system = "Assistant name: " + config.assistant_name + ".\nOperator-defined behavior:\n" + config.instructions + toolPolicy + RESPONSE_STYLE + sourceContext + "\n\n" + FIXED_GUARD;
-          const result = await env.AI.run(config.model, { messages: [{ role: "system", content: system }].concat(messages), temperature: config.temperature, max_tokens: config.max_tokens });
-          content = typeof result.response === "string" ? result.response : result.choices && result.choices[0] && result.choices[0].message ? result.choices[0].message.content : JSON.stringify(result);
+          const generated = await runTextModel(env, config.model, { messages: [{ role: "system", content: system }].concat(messages), temperature: config.temperature, max_tokens: config.max_tokens });
+          content = generated.content || modelFallback(messages);
           content = stripMarkdownHeadingMarkers(content);
           if (!config.shell_suggestions_enabled) content = content.replace(/```(?:termux|bash|sh|shell)\s*\n[\s\S]*?```/gi, "[Shell command suggestions are disabled by the operator.]");
           if (sources.length) content = formatResearchReply(content, sources);
-          usage = result.usage || {};
+          usage = generated.result && generated.result.usage || {};
         }
         return json({ id: "chatcmpl-" + crypto.randomUUID(), object: "chat.completion", created: Math.floor(Date.now() / 1000), model: config.model, choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }], usage });
       }
@@ -1119,11 +1155,11 @@ export default {
         const context = contexts.length ? "\n\nConnected project context (subject to operator policy):\n" + contexts.join("\n\n") : "";
         const toolPolicy = "\n\nEnabled tools: internet search is " + (config.web_search_enabled ? "available through /api/search" : "disabled") + "; shell command suggestions are " + (config.shell_suggestions_enabled ? "allowed as unexecuted proposals" : "disabled");
         const system = "Assistant name: " + config.assistant_name + ".\nOperator-defined behavior:\n" + config.instructions + context + toolPolicy + RESPONSE_STYLE + "\n\n" + FIXED_GUARD;
-        const result = await env.AI.run(config.model, { messages: [{ role: "system", content: system }].concat(messages), temperature: config.temperature, max_tokens: config.max_tokens });
-        let content = typeof result.response === "string" ? result.response : result.choices && result.choices[0] && result.choices[0].message ? result.choices[0].message.content : JSON.stringify(result);
+        const generated = await runTextModel(env, config.model, { messages: [{ role: "system", content: system }].concat(messages), temperature: config.temperature, max_tokens: config.max_tokens });
+        let content = generated.content || modelFallback(messages);
         content = stripMarkdownHeadingMarkers(content);
         if (!config.shell_suggestions_enabled) content = content.replace(/```(?:termux|bash|sh|shell)\s*\n[\s\S]*?```/gi, "[Shell command suggestions are disabled by the operator.]");
-        return json({ id: "chatcmpl-" + crypto.randomUUID(), object: "chat.completion", created: Math.floor(Date.now() / 1000), model: config.model, choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }], usage: result.usage || {} });
+        return json({ id: "chatcmpl-" + crypto.randomUUID(), object: "chat.completion", created: Math.floor(Date.now() / 1000), model: config.model, choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }], usage: generated.result && generated.result.usage || {} });
       }
       return json({ error: "Method not allowed" }, 405);
     } catch (error) {
