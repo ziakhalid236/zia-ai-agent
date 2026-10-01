@@ -1,6 +1,7 @@
 const MAX_WHATSAPP_MEDIA_BYTES = 15_000_000;
 const MAX_RESEARCH_PAGE_BYTES = 1024 * 1024;
 const MAX_RESEARCH_PAGE_CHARS = 8000;
+const MAX_ATTACHMENT_TEXT_CHARS = 24000;
 const NEWS_RSS_FEEDS = ["https://feeds.bbci.co.uk/urdu/rss.xml", "https://www.dawn.com/feeds/home"];
 
 function decodeHtml(value) {
@@ -40,7 +41,7 @@ async function fetchPublicUrl(value, base) {
   throw new Error("The public link could not be opened");
 }
 
-async function readBytesLimited(response, maxBytes) {
+export async function readBytesLimited(response, maxBytes) {
   const contentLength = Number(response.headers.get("content-length") || 0);
   if (contentLength > maxBytes) throw new Error("The file exceeds the safe download limit");
   if (!response.body) {
@@ -65,6 +66,15 @@ async function readBytesLimited(response, maxBytes) {
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
   return bytes;
+}
+
+export async function convertAttachmentToText(name, bytes, mimeType, ai) {
+  if (!ai || typeof ai.toMarkdown !== "function") throw new Error("Cloudflare document conversion is not available");
+  const result = await ai.toMarkdown({ name, blob: new Blob([bytes], { type: mimeType }) });
+  const document = Array.isArray(result) ? result[0] : result;
+  if (!document || document.format === "error") throw new Error(String(document && document.error || "This file could not be converted"));
+  if (typeof document.data !== "string" || !document.data.trim()) throw new Error("This file did not contain readable text");
+  return document.data.trim().slice(0, MAX_ATTACHMENT_TEXT_CHARS);
 }
 
 const MEDIA_BY_EXTENSION = {
@@ -161,9 +171,12 @@ export async function sendWhatsAppText(recipient, text, env, sendRequest) {
 }
 
 export async function searchWeb(query) {
-  const response = await fetch("https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query), { headers: { "user-agent": "Mozilla/5.0 (compatible; ZiaAI/1.0)" } });
+  const response = await fetch("https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query), {
+    headers: { "user-agent": "Mozilla/5.0 (compatible; ZiaAI/1.0)" },
+    signal: AbortSignal.timeout(10000),
+  });
   if (!response.ok) throw new Error("Search provider returned " + response.status);
-  const html = await response.text();
+  const html = new TextDecoder().decode(await readBytesLimited(response, 512 * 1024));
   const starts = [...html.matchAll(/<div class="result(?:\s|\")[^>]*>/g)];
   return starts.slice(0, 6).map((marker, index) => {
     const row = html.slice(marker.index, starts[index + 1] ? starts[index + 1].index : html.length);
@@ -181,7 +194,7 @@ function isCurrentNewsRequest(text) {
 }
 
 export function isResearchRequest(text) {
-  return /\b(?:today'?s|today|current|latest|breaking|news|research|sources?|citations?|cite|websites?|search|compare|collect data|fact[ -]?check|verify|find out)\b|آج کی (?:خبریں|نیوز)|تازہ (?:خبریں|نیوز)|تحقیق|حوالہ|ویب سائٹ|موازنہ|معلومات تلاش/iu.test(text);
+  return /\b(?:today'?s|today|current|latest|breaking|news|research|sources?|citations?|cite|websites?|search|compare|collect data|fact[ -]?check|verify|find out)\b|آج کی (?:خبریں|نیوز)|تازہ (?:خبریں|نیوز)|تحقیق|حوالہ|ویب سائٹ|موازنہ|معلومات تلاش|اس صفحے کو پڑھ|اس صفحے کا خلاصہ|اس لنک کو پڑھ|لنک کا خلاصہ/iu.test(text);
 }
 
 export function isReportFileRequest(text) {
@@ -298,12 +311,20 @@ async function fetchNewsFeed(feedUrl) {
 export async function researchWeb(requestText) {
   const currentNews = isCurrentNewsRequest(requestText);
   const query = researchSearchQuery(requestText);
+  const directUrls = requestUrls(requestText).slice(0, 3);
+  const directPages = await Promise.all(directUrls.map(async (url) => {
+    try { return await fetchResearchPage({ title: url, url }); } catch (_) { return null; }
+  }));
   let results = [];
-  try { results = await searchWeb(query); } catch (error) { if (!currentNews) throw error; }
+  if (!directUrls.length) {
+    try { results = await searchWeb(query); } catch (error) { if (!currentNews) throw error; }
+  }
   const pages = await Promise.all(results.slice(0, 5).map(async (result) => {
     try { return await fetchResearchPage(result); } catch (_) { return null; }
   }));
-  let sources = pages.filter(Boolean).slice(0, 4);
+  const uniqueSources = new Map();
+  for (const source of directPages.concat(pages).filter(Boolean)) uniqueSources.set(source.url, source);
+  let sources = [...uniqueSources.values()].slice(0, 4);
   if (!sources.length && currentNews) {
     const feeds = await Promise.all(NEWS_RSS_FEEDS.map(async (url) => {
       try { return await fetchNewsFeed(url); } catch (_) { return []; }
@@ -326,7 +347,7 @@ export function researchPrompt(sources) {
 }
 
 export function formatResearchReply(answer, sources) {
-  const references = researchSourceList(sources.slice(0, 3));
+  const references = researchSourceList(sources.slice(0, 4));
   const suffix = "\n\nSources:\n" + references;
   return String(answer).slice(0, Math.max(0, 4096 - suffix.length)).trim() + suffix;
 }
