@@ -9,6 +9,7 @@ const API_TOKEN = "a".repeat(48);
 function makeKV() {
   const values = new Map();
   return {
+    values,
     async get(key, type) {
       const value = values.get(key);
       if (value === undefined) return null;
@@ -51,6 +52,40 @@ function request(path, token, method = "GET", body) {
   });
 }
 
+async function runWhatsAppSchedule(env) {
+  let scheduled;
+  worker.scheduled({}, env, { waitUntil(promise) { scheduled = promise; } });
+  await scheduled;
+}
+
+function installWhatsAppMock(batches) {
+  const githubCalls = installGitHubMock();
+  const githubFetch = globalThis.fetch;
+  const sentMessages = [];
+  let poll = 0;
+  globalThis.fetch = async (input, options = {}) => {
+    const url = new URL(String(input));
+    if (url.origin === "https://api.whatsapp.com" && url.pathname.endsWith("/updates")) {
+      const messages = batches[poll] || [];
+      poll++;
+      return response({ messages, next_offset: String(poll) });
+    }
+    if (url.origin === "https://api.whatsapp.com" && url.pathname.endsWith("/messages")) {
+      sentMessages.push(JSON.parse(options.body));
+      return response({ message_id: "reply-" + sentMessages.length });
+    }
+    return githubFetch(input, options);
+  };
+  return { githubCalls, sentMessages };
+}
+
+function makeWhatsAppEnv() {
+  const env = makeEnv();
+  env.WHATSAPP_AGENT_API_KEY = "whatsapp-key-fixture";
+  env.AI = { async run() { throw new Error("AI should not run for GitHub commands"); } };
+  return env;
+}
+
 function installGitHubMock() {
   const calls = [];
   globalThis.fetch = async (input, options = {}) => {
@@ -86,6 +121,50 @@ test("control room renders a separate GitHub panel", async () => {
   assert.match(html, /data-view="github"/);
   assert.match(html, /id="github" class="panel"/);
   assert.match(html, /Every write requires a confirmation/);
+  assert.match(html, /WhatsApp supports repository listing and confirmed private creation/);
+});
+
+test("WhatsApp can list owned GitHub repositories", async () => {
+  const env = makeWhatsAppEnv();
+  const { sentMessages } = installWhatsAppMock([[{ id: "wa-list", from: "user:creator", text: "/github repos" }]]);
+  await runWhatsAppSchedule(env);
+  assert.match(sentMessages[0].text.body, /Repositories owned by @zia/);
+  assert.match(sentMessages[0].text.body, /zia\/agent \(private\)/);
+});
+
+test("WhatsApp repository creation requires a same-sender confirmation", async () => {
+  const env = makeWhatsAppEnv();
+  const batches = [
+    [{ id: "wa-ask", from: "user:creator", text: "Repository aap banaen" }],
+    [{ id: "wa-stage", from: "user:creator", text: "/github create new-private-repo" }],
+    [],
+    [],
+  ];
+  const { githubCalls, sentMessages } = installWhatsAppMock(batches);
+
+  await runWhatsAppSchedule(env);
+  assert.match(sentMessages[0].text.body, /\/github create <name>/);
+  await runWhatsAppSchedule(env);
+  const code = /CONFIRM ([A-F0-9]{12})/.exec(sentMessages[1].text.body);
+  assert.ok(code);
+  const ownerHistory = [...env.CONFIG.values.entries()].find(([key]) => key.startsWith("whatsapp:history:"))[1];
+  assert.doesNotMatch(ownerHistory, new RegExp(code[1]));
+  assert.equal(githubCalls.some((call) => call.method === "POST" && call.pathname === "/user/repos"), false);
+
+  batches[2] = [{ id: "wa-wrong-sender", from: "user:other", text: "CONFIRM " + code[1] }];
+  await runWhatsAppSchedule(env);
+  assert.match(sentMessages[2].text.body, /no active GitHub action/i);
+  assert.equal(githubCalls.some((call) => call.method === "POST" && call.pathname === "/user/repos"), false);
+
+  batches[3] = [{ id: "wa-confirm", from: "user:creator", text: "CONFIRM " + code[1] }];
+  await runWhatsAppSchedule(env);
+  assert.match(sentMessages[3].text.body, /Created private repository zia\/new-private-repo/);
+  const savedHistory = [...env.CONFIG.values.entries()].filter(([key]) => key.startsWith("whatsapp:history:")).map((entry) => entry[1]).join("\n");
+  assert.doesNotMatch(savedHistory, new RegExp(code[1]));
+  const create = githubCalls.find((call) => call.method === "POST" && call.pathname === "/user/repos");
+  assert.equal(create.body.name, "new-private-repo");
+  assert.equal(create.body.private, true);
+  assert.equal(create.body.auto_init, true);
 });
 
 test("lists owned repositories and creates a private repository", async () => {
