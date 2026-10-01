@@ -3,7 +3,10 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const source = await readFile(new URL("./worker-zia.js", import.meta.url), "utf8");
-const { default: worker } = await import("data:text/javascript;base64," + Buffer.from(source).toString("base64"));
+const toolSource = await readFile(new URL("./worker-zia-tools.js", import.meta.url), "utf8");
+const toolsModule = "data:text/javascript;base64," + Buffer.from(toolSource).toString("base64");
+const bundledSource = source.replace('from "./worker-zia-tools.js";', "from \"" + toolsModule + "\";");
+const { default: worker } = await import("data:text/javascript;base64," + Buffer.from(bundledSource).toString("base64"));
 const API_TOKEN = "a".repeat(48);
 
 function makeKV() {
@@ -58,10 +61,11 @@ async function runWhatsAppSchedule(env) {
   await scheduled;
 }
 
-function installWhatsAppMock(batches) {
+function installWhatsAppMock(batches, web = {}) {
   const githubCalls = installGitHubMock();
   const githubFetch = globalThis.fetch;
   const sentMessages = [];
+  const uploadedMedia = [];
   let poll = 0;
   globalThis.fetch = async (input, options = {}) => {
     const url = new URL(String(input));
@@ -70,19 +74,29 @@ function installWhatsAppMock(batches) {
       poll++;
       return response({ messages, next_offset: String(poll) });
     }
+    if (url.origin === "https://api.whatsapp.com" && url.pathname.endsWith("/media") && options.method === "POST") {
+      const file = options.body.get("file");
+      uploadedMedia.push({ type: options.body.get("type"), filename: file.name, contentType: file.type, bytes: new Uint8Array(await file.arrayBuffer()) });
+      return response({ id: "media-" + uploadedMedia.length });
+    }
     if (url.origin === "https://api.whatsapp.com" && url.pathname.endsWith("/messages")) {
-      sentMessages.push(JSON.parse(options.body));
+      const outgoing = JSON.parse(options.body);
+      sentMessages.push(outgoing);
+      if (web.rejectMediaSend && outgoing.type !== "text") return response({ error: "unsupported media" }, 400);
       return response({ message_id: "reply-" + sentMessages.length });
     }
+    if (url.origin === "https://html.duckduckgo.com") return new Response(web.searchHtml || "", { headers: { "content-type": "text/html" } });
+    if (web.pages && Object.hasOwn(web.pages, url.href)) return web.pages[url.href];
+    if (web.files && Object.hasOwn(web.files, url.href)) return web.files[url.href];
     return githubFetch(input, options);
   };
-  return { githubCalls, sentMessages };
+  return { githubCalls, sentMessages, uploadedMedia };
 }
 
-function makeWhatsAppEnv() {
+function makeWhatsAppEnv(ai) {
   const env = makeEnv();
   env.WHATSAPP_AGENT_API_KEY = "whatsapp-key-fixture";
-  env.AI = { async run() { throw new Error("AI should not run for GitHub commands"); } };
+  env.AI = ai || { async run() { throw new Error("AI should not run for GitHub commands"); } };
   return env;
 }
 
@@ -122,6 +136,8 @@ test("control room renders a separate GitHub panel", async () => {
   assert.match(html, /id="github" class="panel"/);
   assert.match(html, /Every write requires a confirmation/);
   assert.match(html, /WhatsApp supports repository listing and confirmed private creation/);
+  assert.match(html, /fetch readable source pages, and include citations/);
+  assert.match(html, /source-linked plain-text \(\.txt\) reports/);
 });
 
 test("WhatsApp can list owned GitHub repositories", async () => {
@@ -165,6 +181,130 @@ test("WhatsApp repository creation requires a same-sender confirmation", async (
   assert.equal(create.body.name, "new-private-repo");
   assert.equal(create.body.private, true);
   assert.equal(create.body.auto_init, true);
+});
+
+function researchFixture() {
+  const url = "https://news.example.org/story";
+  return {
+    searchHtml: '<div class="result result--web"><a class="result__a" href="' + url + '">Verified news update</a><a class="result__snippet">A reported development with details.</a></div>',
+    pages: {
+      [url]: new Response('<html><head><title>Verified news update</title><meta property="article:published_time" content="2026-10-01T08:00:00Z"></head><body><nav>Ignore navigation</nav><article><p>On October 1, the agency announced a specific public measure after publishing new figures. The statement explains that the measure starts this month and applies to regional services. It also links the change to the results of a documented review and identifies the responsible department.</p></article></body></html>', { headers: { "content-type": "text/html; charset=utf-8" } }),
+    },
+  };
+}
+
+test("WhatsApp research fetches source pages and includes citations", async () => {
+  const aiCalls = [];
+  const env = makeWhatsAppEnv({ async run(_model, input) { aiCalls.push(input); return { response: "The agency announced a regional measure beginning this month [1]." }; } });
+  const fixture = researchFixture();
+  const { sentMessages } = installWhatsAppMock([[{ id: "wa-research", from: "user:creator", text: "What are today's latest news about the agency?" }]], fixture);
+
+  await runWhatsAppSchedule(env);
+
+  assert.equal(aiCalls.length, 1);
+  assert.match(aiCalls[0].messages[0].content, /Verified web pages fetched/);
+  assert.match(aiCalls[0].messages[0].content, /The statement explains that the measure starts this month/);
+  assert.match(sentMessages[0].text.body, /regional measure beginning this month \[1\]/);
+  assert.match(sentMessages[0].text.body, /Sources:/);
+  assert.match(sentMessages[0].text.body, /https:\/\/news\.example\.org\/story/);
+});
+
+test("WhatsApp can create and attach a source-linked research report", async () => {
+  const env = makeWhatsAppEnv({ async run() { return { response: "The reported figures changed during the review [1]." }; } });
+  const fixture = researchFixture();
+  const { sentMessages, uploadedMedia } = installWhatsAppMock([[{ id: "wa-report", from: "user:creator", text: "Research the agency's new figures and create a report file" }]], fixture);
+
+  await runWhatsAppSchedule(env);
+
+  assert.equal(uploadedMedia.length, 1);
+  assert.equal(uploadedMedia[0].type, "text/plain");
+  assert.match(uploadedMedia[0].filename, /^zia-report-.*\.txt$/);
+  const report = new TextDecoder().decode(uploadedMedia[0].bytes);
+  assert.match(report, /The reported figures changed during the review \[1\]/);
+  assert.match(report, /https:\/\/news\.example\.org\/story/);
+  assert.equal(sentMessages[0].type, "document");
+  assert.match(sentMessages[0].document.filename, /\.txt$/);
+});
+
+test("WhatsApp can download and send an allowed direct public video", async () => {
+  const env = makeWhatsAppEnv();
+  const videoUrl = "https://cdn.example.org/lesson.mp4";
+  const video = new Response(new Uint8Array([0, 0, 0, 24, 102, 116, 121, 112]), { headers: { "content-type": "video/mp4" } });
+  const { sentMessages, uploadedMedia } = installWhatsAppMock([[{ id: "wa-video", from: "user:creator", text: "Send this public lecture video I have permission to share: " + videoUrl }]], { files: { [videoUrl]: video } });
+
+  await runWhatsAppSchedule(env);
+
+  assert.equal(uploadedMedia.length, 1);
+  assert.equal(uploadedMedia[0].type, "video/mp4");
+  assert.equal(uploadedMedia[0].filename, "lesson.mp4");
+  assert.equal(sentMessages[0].type, "video");
+  assert.match(sentMessages[0].video.caption, /cdn\.example\.org\/lesson\.mp4/);
+});
+
+test("WhatsApp asks before redistributing media discovered by search", async () => {
+  const env = makeWhatsAppEnv();
+  const videoUrl = "https://cdn.example.org/open-lecture.mp4";
+  const video = new Response(new Uint8Array([1, 2, 3]), { headers: { "content-type": "video/mp4" } });
+  const searchHtml = '<div class="result result--web"><a class="result__a" href="' + videoUrl + '">Open lecture video</a></div>';
+  const { sentMessages, uploadedMedia } = installWhatsAppMock([[{ id: "wa-rights", from: "user:creator", text: "Download and send the lecture video about physics" }]], { searchHtml, files: { [videoUrl]: video } });
+
+  await runWhatsAppSchedule(env);
+
+  assert.equal(uploadedMedia.length, 0);
+  assert.equal(sentMessages[0].type, "text");
+  assert.match(sentMessages[0].text.body, /confirm that you own the file or have permission/);
+});
+
+test("WhatsApp refuses oversized media without uploading it", async () => {
+  const env = makeWhatsAppEnv();
+  const videoUrl = "https://cdn.example.org/large.mp4";
+  const large = new Response(null, { status: 206, headers: { "content-type": "video/mp4", "content-length": String(16 * 1024 * 1024) } });
+  const { sentMessages, uploadedMedia } = installWhatsAppMock([[{ id: "wa-large", from: "user:creator", text: "Send this lecture video: " + videoUrl }]], { files: { [videoUrl]: large } });
+
+  await runWhatsAppSchedule(env);
+
+  assert.equal(uploadedMedia.length, 0);
+  assert.equal(sentMessages[0].type, "text");
+  assert.match(sentMessages[0].text.body, /safe download limit/);
+});
+
+test("WhatsApp refuses private-network media URLs", async () => {
+  const env = makeWhatsAppEnv();
+  const { sentMessages, uploadedMedia } = installWhatsAppMock([[{ id: "wa-private-url", from: "user:creator", text: "Send this video: https://127.0.0.1/private.mp4" }]]);
+
+  await runWhatsAppSchedule(env);
+
+  assert.equal(uploadedMedia.length, 0);
+  assert.equal(sentMessages[0].type, "text");
+  assert.match(sentMessages[0].text.body, /public HTTPS/);
+});
+
+test("WhatsApp explains media codec rejection without retrying the attachment", async () => {
+  const env = makeWhatsAppEnv();
+  const videoUrl = "https://cdn.example.org/bad-codec.mp4";
+  const video = new Response(new Uint8Array([1, 2, 3]), { headers: { "content-type": "video/mp4" } });
+  const { sentMessages } = installWhatsAppMock([[{ id: "wa-codec", from: "user:creator", text: "Send this video: " + videoUrl }]], { files: { [videoUrl]: video }, rejectMediaSend: true });
+
+  await runWhatsAppSchedule(env);
+
+  assert.equal(sentMessages[0].type, "video");
+  assert.equal(sentMessages[1].type, "text");
+  assert.match(sentMessages[1].text.body, /unsupported codec or file type/);
+});
+
+test("WhatsApp does not invent an answer when no source page is readable", async () => {
+  let aiCalled = false;
+  const env = makeWhatsAppEnv({ async run() { aiCalled = true; return { response: "unsupported claim" }; } });
+  const fixture = {
+    searchHtml: '<div class="result result--web"><a class="result__a" href="https://news.example.org/empty">Empty source</a><a class="result__snippet">A snippet that was not verified.</a></div>',
+    pages: { "https://news.example.org/empty": new Response("<html><body>short</body></html>", { headers: { "content-type": "text/html" } }) },
+  };
+  const { sentMessages } = installWhatsAppMock([[{ id: "wa-unverified", from: "user:creator", text: "What is today's latest news?" }]], fixture);
+
+  await runWhatsAppSchedule(env);
+
+  assert.equal(aiCalled, false);
+  assert.match(sentMessages[0].text.body, /won't present search snippets as verified facts/);
 });
 
 test("lists owned repositories and creates a private repository", async () => {
