@@ -4,21 +4,29 @@ An OpenAI-compatible AI service on Cloudflare Workers, with a small control room
 
 - The model is hosted by Cloudflare Workers AI; this repository does not contain model weights.
 - The Worker suggests shell commands but never executes them. The Termux client asks before every command.
-- No conversation history is stored by the Worker. Termux keeps chat only in memory while running.
-- The browser chat supports speech input and spoken replies where the browser supports them. Browser speech providers may process microphone audio.
-- The WhatsApp Agent integration is not end-to-end encrypted. Cloud Cron can transcribe voice notes; do not send secrets or sensitive data through it.
+- Website chat history stays in the browser session; the Worker does not save it. WhatsApp keeps up to 20 recent text messages per sender in private KV for 24 hours; attachment contents are not added to that history.
+- The browser chat supports speech input, spoken replies, direct public-page research with citations, and uploads for images, documents, and audio. Short videos are sampled locally into a few frames; their audio is not analyzed.
+- Uploaded file contents, web pages, and WhatsApp attachments are processed by Cloudflare Workers AI. Browser speech providers may process microphone audio. The WhatsApp Agent integration is not end-to-end encrypted; do not send secrets or sensitive data through it.
 
 Urdu instructions: [`README-ur.md`](README-ur.md).
 
 ## Components
 
 - `worker-zia.js`: canonical Cloudflare Worker, control room, API, API-key manager, and scheduled WhatsApp bridge.
-- `worker-zia-tools.js`: bounded public-page research and WhatsApp media/file helpers imported by the Worker.
+- `worker-zia-tools.js`: bounded public-page research and media/file helpers imported by the Worker.
 - `termux_agent.py`: Python client for Android Termux. It saves the service URL but prompts for the API key each time.
 - `zia_whatsapp_agent.py`: optional text-only local WhatsApp poller. Use it only when the Cloudflare Cron poller is disabled.
 - `wrangler.example.jsonc`: safe starting point for another Cloudflare account. Copy it to `wrangler.jsonc` and replace the KV namespace ID before deploying.
 
 Old prototypes (`worker.js`, `worker-cyber.js`, and `demo.html`) are not part of the supported deployment.
+
+## Chat tools and uploads
+
+The signed-in website chat automatically reads a directly shared public HTTPS page or searches the public web for research requests. It cites fetched pages and refuses to present search snippets as verified evidence when no readable page is available. Public pages and extracted file text are untrusted reference data, never instructions.
+
+Use **ADD FILES** to attach up to three files. Supported website inputs include common images, PDF, text, HTML/XML, CSV, Office/ODF documents, and common audio formats. Cloudflare Workers AI analyzes JPEG/PNG/WebP images, transcribes audio, and converts supported documents to Markdown. Each upload is limited to 5 MB for images, 8 MiB for audio, and 15 MB for documents. File/frame analysis is limited to 30 requests per hour per IP to control usage. Cloudflare's documented `toMarkdown` formats are listed in its [supported formats](https://developers.cloudflare.com/workers-ai/features/markdown-conversion/supported-formats/) page.
+
+The browser samples videos of at most 60 seconds and 15 MB into five JPEG frames, then sends those frames to Cloudflare's Moondream vision model. Video sampling runs in the browser; the original video is not uploaded, and its audio is not analyzed. The Moondream model page currently lists $0.30 per million input tokens and $1 per million output tokens; Whisper currently lists $0.000513 per audio minute. Pricing and allowances may change, so check Cloudflare's [Moondream](https://developers.cloudflare.com/workers-ai/models/moondream3.1-9B-A2B/) and [Whisper](https://developers.cloudflare.com/workers-ai/models/whisper-large-v3-turbo/) model pages before frequent use.
 
 ## Required accounts
 
@@ -86,9 +94,9 @@ npx wrangler deploy --config wrangler.jsonc
 6. Open the Worker URL, sign in using `SITE_PASSWORD`, then create a separate named project key in **API** for Termux or server clients. The API key manager stores hashes and only shows a new key once.
 7. For WhatsApp replies, create a personal Agent in WhatsApp, set `WHATSAPP_AGENT_API_KEY` as a Worker secret, and enable the Cron trigger. The repository's config requests `*/1 * * * *`. Do not run the local WhatsApp bridge at the same time; concurrent pollers can replace each other's cursor.
 
-The cloud Cron bridge handles text and voice notes. It downloads audio by the WhatsApp media ID, limits input to 8 MiB, transcribes it with Cloudflare Workers AI (`@cf/openai/whisper-large-v3-turbo`), then sends Zia's text reply. For research requests, it searches DuckDuckGo, fetches readable public source pages, and includes source links. Urdu requests such as `آج کی نیوز` are recognized and cleaned before search. If current-news pages cannot be read, it falls back to the BBC Urdu and Dawn RSS feeds and cites the linked stories; if neither pages nor feed items can be fetched, it will not present search snippets as verified facts. Page/feed text, the request, and voice transcripts are processed by Cloudflare Workers AI. It can create and attach a source-linked plain-text `.txt` report.
+The cloud Cron bridge handles text and voice notes. It downloads audio by the WhatsApp media ID, limits input to 8 MiB, transcribes it with Cloudflare Workers AI (`@cf/openai/whisper-large-v3-turbo`), then sends Zia's text reply. Incoming JPEG/PNG/WebP images are analyzed with Cloudflare's Moondream model; supported documents such as PDF, DOCX, XLSX, CSV, and text are converted with Workers AI Markdown conversion. Those attachment contents are sent for the current reply but are not stored in the 24-hour conversation history. For research requests, it searches DuckDuckGo, fetches readable public source pages, and includes source links. Urdu requests such as `آج کی نیوز` are recognized and cleaned before search. If current-news pages cannot be read, it falls back to the BBC Urdu and Dawn RSS feeds and cites the linked stories; if neither pages nor feed items can be fetched, it will not present search snippets as verified facts. Page/feed text, the request, and voice transcripts are processed by Cloudflare Workers AI. It can create and attach a source-linked plain-text `.txt` report. Incoming WhatsApp video analysis is not supported yet.
 
-The cloud bridge can also download a directly accessible public HTTPS file and send it as WhatsApp media. Supported formats include JPEG/PNG, MP4/3GP, WhatsApp-supported audio, PDF, plain text, and Office documents. Downloads are capped at 15 MB (5 MB for images), below WhatsApp's documented 16 MB video/audio/document and 5 MB image limits. Reports are plain-text `.txt` files, not PDF or spreadsheet exports. No media is transcoded; WhatsApp requires supported video codecs (H.264 video and AAC audio). The Worker will not bypass sign-in, a paywall, or DRM; only request files you are allowed to copy and share. If a file is discovered by search, it asks you to confirm copying/sharing rights before downloading it. Incoming images, documents, and videos are not analyzed yet. Uploaded media expires from WhatsApp's media API after 30 days. The optional local Python receiver remains text-only. Transcription usage is billed under Workers AI; the [model page](https://developers.cloudflare.com/workers-ai/models/whisper-large-v3-turbo/) currently lists $0.000513 per audio minute, subject to Cloudflare's current pricing and allowances.
+The cloud bridge can also download a directly accessible public HTTPS file and send it as WhatsApp media. Supported formats include JPEG/PNG, MP4/3GP, WhatsApp-supported audio, PDF, plain text, and Office documents. Downloads are capped at 15 MB (5 MB for images), below WhatsApp's documented 16 MB video/audio/document and 5 MB image limits. Reports are plain-text `.txt` files, not PDF or spreadsheet exports. No media is transcoded; WhatsApp requires supported video codecs (H.264 video and AAC audio). The Worker will not bypass sign-in, a paywall, or DRM; only request files you are allowed to copy and share. If a file is discovered by search, it asks you to confirm copying/sharing rights before downloading it. Uploaded media expires from WhatsApp's media API after 30 days. The optional local Python receiver remains text-only.
 
 The cloud WhatsApp bridge can list owned GitHub repositories with `/github repos` and create a private repository with `/github create <name>`. A create request only stages the action; creation happens after the same WhatsApp sender replies with the one-time confirmation code, which expires after 10 minutes. `/github cancel` cancels a pending creation. This is available only in the cloud Worker bridge, not the optional local Python receiver. File edits and workflow runs remain in the signed-in website GitHub panel. WhatsApp Agent conversations are not end-to-end encrypted; do not send secrets or sensitive data through WhatsApp.
 
@@ -111,6 +119,8 @@ Content-Type: application/json
 ```
 
 Health check: `GET /api/health`. Search: `GET /api/search?q=...` when enabled in the control room. Project keys are limited to chat, search, and health; they cannot change settings or create/revoke keys. Streaming is not enabled.
+
+The website uses the signed-session-only `/api/chat` route to automatically read public links and run source-cited research. Its `/api/files/analyze` route is also signed-session-only; project API keys cannot upload files. Shell commands are never run by either route. The separate Termux client keeps its explicit approval step for every local command.
 
 ## GitHub controls
 
