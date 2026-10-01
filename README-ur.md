@@ -28,13 +28,23 @@ Sign in at your Worker URL with the website passphrase. Open **Mindset & Permiss
 
 The saved profile persists in KV. Chat history is not stored by the Worker. Browser and WhatsApp clients may keep recent messages in their own memory while running.
 
+ویب سائٹ کی چیٹ اور WhatsApp ایک مرکزی پروفائل استعمال کرتے ہیں۔ Project API key سے آنے والی درخواستیں الگ **API AI Profile** استعمال کرتی ہیں، جسے control room کے **API** حصے میں بدلا جا سکتا ہے۔ پہلی API درخواست پر پرانی ترتیبات کی نقل بنائی جاتی ہے تاکہ موجودہ کلائنٹس کا رویہ برقرار رہے؛ اس کے بعد دونوں پروفائل ایک دوسرے سے آزاد ہوتے ہیں۔ دونوں پھر بھی Cloudflare Workers AI کے اسی model catalog سے ماڈل چنتے ہیں، الگ AI provider نہیں۔
+
+## GitHub controls
+
+Control room کے **GitHub** حصے سے اپنے اکاؤنٹ کی repositories دیکھی، private repository بنائی، 96 KiB تک کی text file لوڈ یا commit کی، اور پہلے سے موجود GitHub Actions workflow چلایا جا سکتا ہے۔ ہر write یا deploy سے پہلے browser تصدیق مانگتا ہے۔ یہ endpoints صرف signed-in control-room session کے لیے ہیں؛ API token، project keys اور WhatsApp bridge انہیں استعمال نہیں کر سکتے۔ Worker، GitHub token کو browser میں واپس نہیں بھیجتا۔
+
+`GITHUB_TOKEN` کو Cloudflare Worker secret کے طور پر رکھیں۔ Fine-grained personal access token میں repository metadata read، contents read/write، اور Actions/workflow write درکار ہیں۔ Repository بنانے کے لیے GitHub کا `Repository creation` write permission استعمال کریں؛ اگر UI میں یہ دستیاب نہ ہو تو GitHub، `Administration` write کو متبادل بتاتا ہے۔ `Pull requests` write موجودہ controls کے لیے لازمی نہیں۔ صرف مطلوبہ repositories تک اجازت محدود رکھیں؛ موجودہ live token پورے اکاؤنٹ کی repositories تک رسائی رکھتا ہے اور 90 دن بعد ختم ہوگا۔
+
+Deploy control صرف پہلے سے موجود workflow چلاتا ہے۔ شامل manual workflow `.github/workflows/deploy.yml` ہے؛ اسے چلانے سے پہلے GitHub Actions میں `CLOUDFLARE_API_TOKEN`، `CLOUDFLARE_ACCOUNT_ID` اور `CONFIG_KV_NAMESPACE_ID` secrets شامل کریں۔ Cloudflare token کو Worker deployment کی ضرورت تک محدود رکھیں۔ Workflow صرف run کے دوران `wrangler.jsonc` بناتا ہے، اس لیے account identifiers repository میں commit نہیں ہوتے۔ `wrangler.jsonc`، API tokens، WhatsApp key یا دوسرے secrets کو repository میں commit نہ کریں۔
+
 ## Project API keys
 
 In the control room, open **API** and create a named project key. The full key is shown once; copy it before leaving the page. Cloudflare KV stores only its SHA-256 hash. Revoke a key from the same panel to stop its access. Project keys are limited to chat, search, and health checks; they cannot edit the control-room profile or manage keys. Keep keys on a backend or in a secret store, never in public browser code. KV revocation may take up to about one minute to propagate globally.
 
 ## Connect another project
 
-Use the service from a backend, command-line tool, or server. Keep `API_TOKEN` on that server; do not put it in public browser JavaScript. Browser apps should call their own backend to avoid exposing the token. The model is selected centrally in the control room. An optional `model` field from a client is accepted for compatibility but does not override that setting. Streaming is not enabled.
+Use the service from a backend, command-line tool, or server. Keep `API_TOKEN` on that server; do not put it in public browser JavaScript. Browser apps should call their own backend to avoid exposing the token. API-key requests use the separate API profile in the control room; website and WhatsApp settings do not change it. Both profiles use the same Cloudflare Workers AI model catalog. An optional `model` field from a client is accepted for compatibility but does not override the API profile. Streaming is not enabled.
 
 ```sh
 curl -s https://YOUR-WORKER.workers.dev/v1/chat/completions \
