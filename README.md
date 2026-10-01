@@ -6,7 +6,7 @@ An OpenAI-compatible AI service on Cloudflare Workers, with a small control room
 - The Worker suggests shell commands but never executes them. The Termux client asks before every command.
 - No conversation history is stored by the Worker. Termux keeps chat only in memory while running.
 - The browser chat supports speech input and spoken replies where the browser supports them. Browser speech providers may process microphone audio.
-- The optional WhatsApp Agent integration is not end-to-end encrypted. Do not send secrets or sensitive data through it.
+- The WhatsApp Agent integration is not end-to-end encrypted. Cloud Cron can transcribe voice notes; do not send secrets or sensitive data through it.
 
 Urdu instructions: [`README-ur.md`](README-ur.md).
 
@@ -14,7 +14,7 @@ Urdu instructions: [`README-ur.md`](README-ur.md).
 
 - `worker-zia.js`: canonical Cloudflare Worker, control room, API, API-key manager, and scheduled WhatsApp bridge.
 - `termux_agent.py`: Python client for Android Termux. It saves the service URL but prompts for the API key each time.
-- `zia_whatsapp_agent.py`: optional local WhatsApp poller. Use it only when the Cloudflare Cron poller is disabled.
+- `zia_whatsapp_agent.py`: optional text-only local WhatsApp poller. Use it only when the Cloudflare Cron poller is disabled.
 - `wrangler.example.jsonc`: safe starting point for another Cloudflare account. Copy it to `wrangler.jsonc` and replace the KV namespace ID before deploying.
 
 Old prototypes (`worker.js`, `worker-cyber.js`, and `demo.html`) are not part of the supported deployment.
@@ -84,6 +84,8 @@ npx wrangler deploy --config wrangler.jsonc
 
 6. Open the Worker URL, sign in using `SITE_PASSWORD`, then create a separate named project key in **API** for Termux or server clients. The API key manager stores hashes and only shows a new key once.
 7. For WhatsApp replies, create a personal Agent in WhatsApp, set `WHATSAPP_AGENT_API_KEY` as a Worker secret, and enable the Cron trigger. The repository's config requests `*/1 * * * *`. Do not run the local WhatsApp bridge at the same time; concurrent pollers can replace each other's cursor.
+
+The cloud Cron bridge handles text and voice notes. It downloads audio by the WhatsApp media ID, limits input to 8 MiB, transcribes it with Cloudflare Workers AI (`@cf/openai/whisper-large-v3-turbo`), then sends Zia's text reply. The optional local Python receiver remains text-only. Transcription usage is billed under Workers AI; the [model page](https://developers.cloudflare.com/workers-ai/models/whisper-large-v3-turbo/) currently lists $0.000513 per audio minute, subject to Cloudflare's current pricing and allowances.
 
 The existing live service is managed by its current Cloudflare account. Deploying a new Worker requires your own account's binding IDs and secrets; source code alone cannot transfer account ownership or credentials.
 
