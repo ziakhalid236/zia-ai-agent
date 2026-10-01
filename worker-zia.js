@@ -224,7 +224,7 @@ const LIVE_PAGE = PAGE
     "Polling runs once per minute; delivery can take up to about a minute.</p><p>Keep exactly one poller",
     "Polling runs once per minute; delivery can take up to about a minute.</p><p>Text and voice notes are supported. Voice notes are downloaded from WhatsApp and transcribed by Cloudflare Workers AI before Zia replies with text.</p><p>Keep exactly one poller"
   )
-  .replace("</section></div></section></main>", "</section>" + GITHUB_PANEL + "</div></section></div></section></main>")
+  .replace("</section></div></section></main>", "</section>" + GITHUB_PANEL.replace("WhatsApp and project API keys cannot use these controls.", "Project API keys cannot use GitHub. WhatsApp supports repository listing and confirmed private creation; file edits and workflow runs stay in this signed-in panel.") + "</div></section></div></section></main>")
   .replace("</body>", GITHUB_SCRIPT + "</body>")
   .replace(
     "</body>",
@@ -443,12 +443,98 @@ async function whatsappHistoryKey(sender) {
 
 async function generateWhatsAppReply(history, config, env) {
   const toolPolicy = "\n\nEnabled tools: internet search is " + (config.web_search_enabled ? "available through the website API only" : "disabled") + "; shell command suggestions are " + (config.shell_suggestions_enabled ? "unexecuted text only" : "disabled");
-  const system = "Assistant name: " + config.assistant_name + ".\nOperator-defined behavior:\n" + config.instructions + toolPolicy + "\n\n" + FIXED_GUARD;
+  const githubPolicy = env.GITHUB_TOKEN
+    ? "\nWhatsApp GitHub actions: list repositories with /github repos; stage a private repository with /github create <name>, then require the same sender to confirm using the one-time code. Only these two GitHub actions are available in WhatsApp. File edits and workflow runs require the signed-in website panel. Never claim another GitHub action was completed."
+    : "\nGitHub actions are not configured in this WhatsApp bridge.";
+  const system = "Assistant name: " + config.assistant_name + ".\nOperator-defined behavior:\n" + config.instructions + toolPolicy + githubPolicy + "\n\n" + FIXED_GUARD;
   const result = await env.AI.run(config.model, { messages: [{ role: "system", content: system }].concat(history), temperature: config.temperature, max_tokens: config.max_tokens });
   let answer = typeof result.response === "string" ? result.response : result.choices && result.choices[0] && result.choices[0].message ? result.choices[0].message.content : JSON.stringify(result);
   answer = stripMarkdownHeadingMarkers(answer);
   if (!config.shell_suggestions_enabled) answer = answer.replace(/```(?:termux|bash|sh|shell)\s*\n[\s\S]*?```/gi, "[Shell command suggestions are disabled by the operator.]");
   return answer.slice(0, 4096);
+}
+
+function parseWhatsAppGitHubCommand(text) {
+  const input = text.trim();
+  const slash = /^\/github(?:\s+([\s\S]+))?$/i.exec(input);
+  if (slash) {
+    const parts = (slash[1] || "help").trim().split(/\s+/);
+    const action = parts[0].toLowerCase();
+    if (["help", "repos", "list"].includes(action) && parts.length === 1) return { type: action === "help" ? "help" : "list" };
+    if (action === "create") return { type: "create", name: parts[1] || "" };
+    if (action === "confirm") return { type: "confirm", code: parts[1] || "" };
+    if (action === "cancel" && parts.length === 1) return { type: "cancel" };
+    return { type: "help" };
+  }
+
+  if (/^(?:please\s+)?(?:list|show)(?:\s+me)?\s+(?:my\s+)?(?:github\s+)?(?:repositories|repos)\s*[?.!]*$/i.test(input)) return { type: "list" };
+  const naturalCreate = /^(?:please\s+)?(?:create|make|start)\s+(?:a\s+)?(?:(?:new|private)\s+)?(?:github\s+)?(?:repository|repos?)\s+(?:(?:named|called)\s+)?([A-Za-z0-9_.-]{1,100})[.!]?$/i.exec(input);
+  const reverseCreate = /^(?:please\s+)?(?:github\s+)?(?:repository|repo)\s+([A-Za-z0-9_.-]{1,100})\s+(?:bana\w*|بنائیں|بناو|بنا)[.!]?$/iu.exec(input);
+  if (naturalCreate || reverseCreate && !["aap", "you", "it", "please"].includes(reverseCreate[1].toLowerCase())) return { type: "create", name: (naturalCreate || reverseCreate)[1] };
+
+  const confirmation = /^confirm\s+([A-F0-9]{12})$/i.exec(input);
+  if (confirmation) return { type: "confirm", code: confirmation[1] };
+  if (/\b(?:repository|repositories|repo|repos)\b/i.test(input) && (/\b(?:create|make|start|bana\w*)\b/i.test(input) || /بنا(?:ئیں|و)?/u.test(input))) return { type: "usage" };
+  return null;
+}
+
+function whatsappGitHubHelp() {
+  return "GitHub actions in this WhatsApp chat:\n/github repos - list your repositories\n/github create <name> - stage a private repository; creation requires a one-time confirmation in this same chat.\nFile edits and workflow runs are available in the signed-in website panel.";
+}
+
+function redactWhatsAppConfirmationCode(text) {
+  return String(text).replace(/(?:\/github\s+)?confirm\s+[A-F0-9]{12}/gi, "CONFIRM [one-time code redacted]");
+}
+
+async function whatsappGitHubReply(text, sender, env) {
+  const command = parseWhatsAppGitHubCommand(text);
+  if (!command) return null;
+  if (command.type === "usage") return "I can create a private GitHub repository for you. Send `/github create <name>`; I will ask for a one-time confirmation in this same chat before creating it.";
+  if (!env.GITHUB_TOKEN) return "GitHub is not configured for this WhatsApp bridge. Add the GITHUB_TOKEN Worker secret first.";
+  if (command.type === "help") return whatsappGitHubHelp();
+  if (command.type === "create" && !/^[A-Za-z0-9_.-]{1,100}$/.test(command.name)) return "Repository names must use 1-100 letters, numbers, dots, underscores, or hyphens. " + whatsappGitHubHelp();
+
+  const pendingKey = "whatsapp:github-pending:" + (await whatsappHistoryKey(sender)).slice("whatsapp:history:".length);
+  if (command.type === "cancel") {
+    await env.CONFIG.delete(pendingKey);
+    return "Pending GitHub repository creation cancelled.";
+  }
+  if (command.type === "create") {
+    const code = crypto.randomUUID().replace(/-/g, "").slice(0, 12).toUpperCase();
+    await env.CONFIG.put(pendingKey, JSON.stringify({ code, name: command.name, created_at: Date.now() }), { expirationTtl: 600 });
+    return "I am ready to create the private repository `" + command.name + "`. To confirm within 10 minutes, reply in this same chat with `CONFIRM " + code + "`. Nothing is created until you confirm.";
+  }
+  if (command.type === "confirm") {
+    const pending = await env.CONFIG.get(pendingKey, "json");
+    const age = pending ? Date.now() - pending.created_at : null;
+    if (!pending || !Number.isFinite(pending.created_at) || age < 0 || age > 10 * 60 * 1000) {
+      await env.CONFIG.delete(pendingKey);
+      return "There is no active GitHub action to confirm. Start again with `/github create <name>`.";
+    }
+    if (!/^[A-F0-9]{12}$/i.test(command.code) || command.code.toUpperCase() !== pending.code) return "That confirmation code does not match. The pending action is unchanged; send the exact code from this same chat or use `/github cancel`.";
+    try {
+      const repository = await githubRequest("/user/repos", env, { method: "POST", body: { name: pending.name, description: "", private: true, auto_init: true } });
+      await env.CONFIG.delete(pendingKey);
+      return "Created private repository " + repository.full_name + ": " + repository.html_url;
+    } catch (error) {
+      const status = error && error.status ? " (HTTP " + error.status + ")" : "";
+      return "GitHub could not create `" + pending.name + "`" + status + ". Check the name and the GITHUB_TOKEN repository-creation permission; the pending confirmation is still available until it expires.";
+    }
+  }
+
+  try {
+    const user = await githubRequest("/user", env);
+    if (!user || typeof user.login !== "string") return "GitHub could not verify the account for this token.";
+    const repositories = await githubRequest("/user/repos?type=owner&sort=updated&per_page=100", env);
+    const owned = (Array.isArray(repositories) ? repositories : []).filter((repo) => repo.owner && typeof repo.owner.login === "string" && repo.owner.login.toLowerCase() === user.login.toLowerCase());
+    if (!owned.length) return "No repositories were found for @" + user.login + ".";
+    const lines = owned.slice(0, 12).map((repo) => "- " + repo.full_name + (repo.private ? " (private)" : " (public)"));
+    if (owned.length > lines.length) lines.push("...and " + (owned.length - lines.length) + " more.");
+    return "Repositories owned by @" + user.login + ":\n" + lines.join("\n");
+  } catch (error) {
+    const status = error && error.status ? " (HTTP " + error.status + ")" : "";
+    return "GitHub repository listing failed" + status + ". Check the GITHUB_TOKEN permissions.";
+  }
 }
 
 async function pollWhatsApp(env) {
@@ -518,9 +604,10 @@ async function pollWhatsApp(env) {
       historyKey = await whatsappHistoryKey(recipient);
       const savedHistory = await env.CONFIG.get(historyKey, "json");
       const history = Array.isArray(savedHistory) ? savedHistory.filter((item) => item && ["user", "assistant"].includes(item.role) && typeof item.content === "string").slice(-18) : [];
-      history.push({ role: "user", content: voiceNote ? "[WhatsApp voice note transcription]\n" + text : text });
-      answer = await generateWhatsAppReply(history, config, env);
-      history.push({ role: "assistant", content: answer });
+      history.push({ role: "user", content: redactWhatsAppConfirmationCode(voiceNote ? "[WhatsApp voice note transcription]\n" + text : text) });
+      answer = await whatsappGitHubReply(text, recipient, env);
+      if (answer === null) answer = await generateWhatsAppReply(history, config, env);
+      history.push({ role: "assistant", content: redactWhatsAppConfirmationCode(answer) });
       nextHistory = history.slice(-20);
     }
     await whatsappRequest(WHATSAPP_API + "/messages", env.WHATSAPP_AGENT_API_KEY, {
