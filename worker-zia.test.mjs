@@ -7,6 +7,7 @@ const toolSource = await readFile(new URL("./worker-zia-tools.js", import.meta.u
 const toolsModule = "data:text/javascript;base64," + Buffer.from(toolSource).toString("base64");
 const bundledSource = source.replace('from "./worker-zia-tools.js";', "from \"" + toolsModule + "\";");
 const { default: worker } = await import("data:text/javascript;base64," + Buffer.from(bundledSource).toString("base64"));
+const { isResearchRequest } = await import(toolsModule);
 const API_TOKEN = "a".repeat(48);
 
 function makeKV() {
@@ -66,6 +67,7 @@ function installWhatsAppMock(batches, web = {}) {
   const githubFetch = globalThis.fetch;
   const sentMessages = [];
   const uploadedMedia = [];
+  const searchQueries = [];
   let poll = 0;
   globalThis.fetch = async (input, options = {}) => {
     const url = new URL(String(input));
@@ -85,12 +87,16 @@ function installWhatsAppMock(batches, web = {}) {
       if (web.rejectMediaSend && outgoing.type !== "text") return response({ error: "unsupported media" }, 400);
       return response({ message_id: "reply-" + sentMessages.length });
     }
-    if (url.origin === "https://html.duckduckgo.com") return new Response(web.searchHtml || "", { headers: { "content-type": "text/html" } });
+    if (url.origin === "https://html.duckduckgo.com") {
+      searchQueries.push(url.searchParams.get("q") || "");
+      return new Response(web.searchHtml || "", { headers: { "content-type": "text/html" } });
+    }
+    if (web.feeds && Object.hasOwn(web.feeds, url.href)) return web.feeds[url.href];
     if (web.pages && Object.hasOwn(web.pages, url.href)) return web.pages[url.href];
     if (web.files && Object.hasOwn(web.files, url.href)) return web.files[url.href];
     return githubFetch(input, options);
   };
-  return { githubCalls, sentMessages, uploadedMedia };
+  return { githubCalls, sentMessages, uploadedMedia, searchQueries };
 }
 
 function makeWhatsAppEnv(ai) {
@@ -197,7 +203,7 @@ test("WhatsApp research fetches source pages and includes citations", async () =
   const aiCalls = [];
   const env = makeWhatsAppEnv({ async run(_model, input) { aiCalls.push(input); return { response: "The agency announced a regional measure beginning this month [1]." }; } });
   const fixture = researchFixture();
-  const { sentMessages } = installWhatsAppMock([[{ id: "wa-research", from: "user:creator", text: "What are today's latest news about the agency?" }]], fixture);
+  const { sentMessages, searchQueries } = installWhatsAppMock([[{ id: "wa-research", from: "user:creator", text: "What are today's latest news about the agency?" }]], fixture);
 
   await runWhatsAppSchedule(env);
 
@@ -207,6 +213,7 @@ test("WhatsApp research fetches source pages and includes citations", async () =
   assert.match(sentMessages[0].text.body, /regional measure beginning this month \[1\]/);
   assert.match(sentMessages[0].text.body, /Sources:/);
   assert.match(sentMessages[0].text.body, /https:\/\/news\.example\.org\/story/);
+  assert.match(searchQueries[0], /agency latest news after:/);
 });
 
 test("WhatsApp can create and attach a source-linked research report", async () => {
@@ -305,6 +312,28 @@ test("WhatsApp does not invent an answer when no source page is readable", async
 
   assert.equal(aiCalled, false);
   assert.match(sentMessages[0].text.body, /won't present search snippets as verified facts/);
+});
+
+test("WhatsApp recognizes Urdu news and creates a report from the BBC Urdu RSS fallback", async () => {
+  const text = "کیا ہوا میں نے کہا آج کی نیوز دیں اب فائل تیار کر کے";
+  assert.equal(isResearchRequest(text), true);
+  const feedUrl = "https://feeds.bbci.co.uk/urdu/rss.xml";
+  const feeds = {
+    [feedUrl]: new Response("<rss><channel><item><title><![CDATA[پاکستان میں تازہ سیاسی پیش رفت]]></title><description><![CDATA[حکومت نے جمعے کو اپوزیشن سے مذاکرات کرنے کا اعلان کیا ہے اور فریقین نے ملاقات پر اتفاق کیا۔]]></description><link>https://www.bbc.co.uk/urdu/news/example</link><pubDate>Fri, 02 Oct 2026 00:00:00 GMT</pubDate></item></channel></rss>", { headers: { "content-type": "application/rss+xml" } }),
+  };
+  const env = makeWhatsAppEnv({ async run(_model, input) {
+    assert.match(input.messages[0].content, /BBC Urdu RSS|پاکستان میں تازہ سیاسی پیش رفت/);
+    return { response: "حکومت نے اپوزیشن سے مذاکرات کا اعلان کیا ہے [1]۔" };
+  } });
+  const { sentMessages, uploadedMedia, searchQueries } = installWhatsAppMock([[{ id: "wa-urdu-news-report", from: "user:creator", text }]], { feeds });
+
+  await runWhatsAppSchedule(env);
+
+  assert.match(searchQueries[0], /^Pakistan and world latest news after:\d{4}-\d{2}-\d{2}$/);
+  assert.equal(uploadedMedia.length, 1);
+  assert.equal(uploadedMedia[0].type, "text/plain");
+  assert.match(new TextDecoder().decode(uploadedMedia[0].bytes), /https:\/\/www\.bbc\.co\.uk\/urdu\/news\/example/);
+  assert.equal(sentMessages[0].type, "document");
 });
 
 test("lists owned repositories and creates a private repository", async () => {
