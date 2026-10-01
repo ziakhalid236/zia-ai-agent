@@ -1,0 +1,38 @@
+name: Deploy Cloudflare Worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate private Wrangler config
+        env:
+          CONFIG_KV_NAMESPACE_ID: ${{ secrets.CONFIG_KV_NAMESPACE_ID }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const namespaceId = process.env.CONFIG_KV_NAMESPACE_ID;
+          if (!namespaceId) throw new Error('Set the CONFIG_KV_NAMESPACE_ID GitHub Actions secret.');
+          fs.writeFileSync('wrangler.jsonc', JSON.stringify({
+            name: 'blacksite-field-ops',
+            main: 'worker-zia.js',
+            compatibility_date: '2026-09-30',
+            ai: { binding: 'AI' },
+            triggers: { crons: ['*/1 * * * *'] },
+            kv_namespaces: [{ binding: 'CONFIG', id: namespaceId }],
+          }, null, 2));
+          NODE
+
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4'
+          command: deploy --config wrangler.jsonc
