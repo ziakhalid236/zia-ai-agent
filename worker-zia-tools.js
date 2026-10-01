@@ -1,6 +1,7 @@
 const MAX_WHATSAPP_MEDIA_BYTES = 15_000_000;
 const MAX_RESEARCH_PAGE_BYTES = 1024 * 1024;
 const MAX_RESEARCH_PAGE_CHARS = 8000;
+const NEWS_RSS_FEEDS = ["https://feeds.bbci.co.uk/urdu/rss.xml", "https://www.dawn.com/feeds/home"];
 
 function decodeHtml(value) {
   return value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;|&#x27;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)));
@@ -176,11 +177,11 @@ export async function searchWeb(query) {
 }
 
 function isCurrentNewsRequest(text) {
-  return /\b(?:today'?s|today|current|latest|breaking)\b|\bnews\b|آج کی خبریں|تازہ خبریں/iu.test(text);
+  return /\b(?:today'?s|today|current|latest|breaking)\b|\bnews\b|آج کی (?:خبریں|نیوز)|تازہ (?:خبریں|نیوز)/iu.test(text);
 }
 
 export function isResearchRequest(text) {
-  return /\b(?:today'?s|today|current|latest|breaking|news|research|sources?|citations?|cite|websites?|search|compare|collect data|fact[ -]?check|verify|find out)\b|تازہ خبریں|تحقیق|حوالہ|ویب سائٹ|موازنہ|معلومات تلاش/iu.test(text);
+  return /\b(?:today'?s|today|current|latest|breaking|news|research|sources?|citations?|cite|websites?|search|compare|collect data|fact[ -]?check|verify|find out)\b|آج کی (?:خبریں|نیوز)|تازہ (?:خبریں|نیوز)|تحقیق|حوالہ|ویب سائٹ|موازنہ|معلومات تلاش/iu.test(text);
 }
 
 export function isReportFileRequest(text) {
@@ -249,17 +250,66 @@ async function fetchResearchPage(result) {
   return { title: title.slice(0, 240), url: url.href, published: String(published).slice(0, 80), content, mediaCandidates };
 }
 
+function researchSearchQuery(text) {
+  let query = String(text).replace(/https?:\/\/[^\s<>"']+/gi, " ").replace(/\s+/g, " ").trim().slice(0, 260);
+  if (!isCurrentNewsRequest(text)) return query;
+
+  const topic = query
+    .replace(/\b(?:please|can you|could you|what is|what are|tell me|i said|i told you|today'?s|today|current|latest|breaking|news|report|document|spreadsheet|csv|file|attachment|data table|prepare|create|make|send|attach|share|download|give|now|for|about|the|me|to|and|a|an)\b/gi, " ")
+    .replace(/(?:کیا ہوا|میں نے کہا|آج کی|آج|تازہ|خبریں|خبر|نیوز|بریکنگ|رپورٹ|فائل|تیار|کر کے|بنا کر|دیں|دے|اب|براہِ کرم|براہ کرم|ہے|ہیں|میں|کو|کی|کے|کا|اور)/gu, " ")
+    .replace(/[\p{P}\p{S}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const subject = topic || "Pakistan and world";
+  const recent = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  return (subject + " latest news after:" + recent).slice(0, 300);
+}
+
+function rssValue(item, tag) {
+  const match = new RegExp("<" + tag + "(?:\\s[^>]*)?>([\\s\\S]*?)</" + tag + ">", "i").exec(item);
+  if (!match) return "";
+  return decodeHtml(match[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim());
+}
+
+function newsSourcesFromRss(xml) {
+  return [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)].slice(0, 4).map((match) => {
+    const item = match[1];
+    const title = rssValue(item, "title");
+    const url = safePublicUrl(rssValue(item, "link"));
+    const description = rssValue(item, "description") || rssValue(item, "content:encoded");
+    if (!title || !url || description.length < 40) return null;
+    return {
+      title: title.slice(0, 240),
+      url: url.href,
+      published: rssValue(item, "pubDate") || "date not stated",
+      content: (title + ". " + description).slice(0, MAX_RESEARCH_PAGE_CHARS),
+      mediaCandidates: [],
+    };
+  }).filter(Boolean);
+}
+
+async function fetchNewsFeed(feedUrl) {
+  const { response } = await fetchPublicUrl(feedUrl);
+  if (!response.ok) return [];
+  const bytes = await readBytesLimited(response, 512 * 1024);
+  return newsSourcesFromRss(new TextDecoder().decode(bytes));
+}
+
 export async function researchWeb(requestText) {
-  let query = String(requestText).replace(/https?:\/\/[^\s<>"']+/gi, " ").replace(/\s+/g, " ").trim().slice(0, 260);
-  if (isCurrentNewsRequest(requestText)) {
-    const recent = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-    query = (query + " after:" + recent).slice(0, 300);
-  }
-  const results = await searchWeb(query);
+  const currentNews = isCurrentNewsRequest(requestText);
+  const query = researchSearchQuery(requestText);
+  let results = [];
+  try { results = await searchWeb(query); } catch (error) { if (!currentNews) throw error; }
   const pages = await Promise.all(results.slice(0, 5).map(async (result) => {
     try { return await fetchResearchPage(result); } catch (_) { return null; }
   }));
-  const sources = pages.filter(Boolean).slice(0, 4);
+  let sources = pages.filter(Boolean).slice(0, 4);
+  if (!sources.length && currentNews) {
+    const feeds = await Promise.all(NEWS_RSS_FEEDS.map(async (url) => {
+      try { return await fetchNewsFeed(url); } catch (_) { return []; }
+    }));
+    sources = feeds.flat().slice(0, 4);
+  }
   const mediaCandidates = Array.from(new Set(results.map((result) => {
     const url = safePublicUrl(result.url);
     return url && mediaSpec(url, "application/octet-stream") ? url.href : null;
