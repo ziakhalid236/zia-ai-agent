@@ -1,6 +1,9 @@
-# Zia AI Agent
+# Zoya AI Agent
 
 An OpenAI-compatible AI service on Cloudflare Workers, with a small control room, an approval-based Termux client, and an optional WhatsApp Agent bridge.
+
+- The main assistant profile is named Zoya. WhatsApp defaults to short, warm, lightly romantic adult-companion chat; ordinary conversation does not trigger research. Research remains available when requested.
+- Prompt and model settings can reduce unnecessary refusals, but cannot override the hosted model's safeguards or provider terms. Core protections for secrets, authorization, and command approval remain enabled.
 
 - The model is hosted by Cloudflare Workers AI; this repository does not contain model weights.
 - The Worker suggests shell commands but never executes them. The Termux client asks before every command.
