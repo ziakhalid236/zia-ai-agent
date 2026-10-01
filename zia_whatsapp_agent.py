@@ -127,7 +127,7 @@ def process_update(update, whatsapp_token, zia_url, zia_token, state, histories,
         answer = pending_replies.get(message_id) if message_id else None
         if answer is None:
             if text is None:
-                answer = "I can handle text messages right now. Please send your request as text."
+                answer = "This local bridge handles text only. To use voice notes, enable the cloud Worker Cron bridge and stop this receiver."
             else:
                 history = histories.setdefault(recipient, [])
                 pending = (history + [{"role": "user", "content": text}])[-30:]
