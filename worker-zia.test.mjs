@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { Script } from "node:vm";
 
 const source = await readFile(new URL("./worker-zia.js", import.meta.url), "utf8");
 const toolSource = await readFile(new URL("./worker-zia-tools.js", import.meta.url), "utf8");
@@ -56,6 +57,13 @@ function request(path, token, method = "GET", body) {
   });
 }
 
+function uploadRequest(token, name, mimeType, bytes, prompt = "") {
+  const form = new FormData();
+  form.append("file", new Blob([bytes], { type: mimeType }), name);
+  form.append("prompt", prompt);
+  return new Request("https://unit.test/api/files/analyze", { method: "POST", headers: { authorization: "Bearer " + token }, body: form });
+}
+
 async function runWhatsAppSchedule(env) {
   let scheduled;
   worker.scheduled({}, env, { waitUntil(promise) { scheduled = promise; } });
@@ -76,6 +84,11 @@ function installWhatsAppMock(batches, web = {}) {
       poll++;
       return response({ messages, next_offset: String(poll) });
     }
+    if (url.origin === "https://api.whatsapp.com" && url.pathname.includes("/media/") && options.method !== "POST") {
+      const id = decodeURIComponent(url.pathname.split("/").pop());
+      return response(web.incomingMedia && web.incomingMedia[id] || { error: "Not Found" }, web.incomingMedia && web.incomingMedia[id] ? 200 : 404);
+    }
+    if (url.origin === "https://lookaside.fbsbx.com" && web.incomingFiles && Object.hasOwn(web.incomingFiles, url.href)) return web.incomingFiles[url.href];
     if (url.origin === "https://api.whatsapp.com" && url.pathname.endsWith("/media") && options.method === "POST") {
       const file = options.body.get("file");
       uploadedMedia.push({ type: options.body.get("type"), filename: file.name, contentType: file.type, bytes: new Uint8Array(await file.arrayBuffer()) });
@@ -144,6 +157,78 @@ test("control room renders a separate GitHub panel", async () => {
   assert.match(html, /WhatsApp supports repository listing and confirmed private creation/);
   assert.match(html, /fetch readable source pages, and include citations/);
   assert.match(html, /source-linked plain-text \(\.txt\) reports/);
+  assert.match(html, /id="attachButton"/);
+  assert.match(html, /sampled frames, no audio analysis/);
+  assert.match(html, /richMessage/);
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  assert.ok(scripts.length >= 4);
+  scripts.forEach((match, index) => new Script(match[1], { filename: "control-room-" + index + ".js" }));
+});
+
+test("website chat automatically reads and cites a shared public page", async () => {
+  const env = makeEnv();
+  const aiCalls = [];
+  env.AI = { async run(_model, input) { aiCalls.push(input); return { response: "The agency announced a regional measure [1]." }; } };
+  const token = await signedIn(env);
+  const fixture = researchFixture();
+  const { searchQueries } = installWhatsAppMock([], fixture);
+  const result = await worker.fetch(request("/api/chat", token, "POST", { messages: [{ role: "user", content: "Summarize this page: https://news.example.org/story" }] }), env);
+  const data = await result.json();
+  assert.equal(result.status, 200);
+  assert.equal(aiCalls.length, 1);
+  assert.match(aiCalls[0].messages[0].content, /Verified web pages fetched/);
+  assert.match(aiCalls[0].messages[0].content, /responsible department/);
+  assert.equal(searchQueries.length, 0);
+  assert.match(data.choices[0].message.content, /regional measure \[1\]/);
+  assert.match(data.choices[0].message.content, /https:\/\/news\.example\.org\/story/);
+});
+
+test("website attachment analysis requires a signed-in session", async () => {
+  const env = makeEnv();
+  const result = await worker.fetch(uploadRequest("", "brief.pdf", "application/pdf", "pdf"), env);
+  assert.equal(result.status, 403);
+});
+
+test("website chat converts supported documents without saving extracted text", async () => {
+  const env = makeEnv();
+  const converted = [];
+  env.AI = { async toMarkdown(input) { converted.push(input); return { format: "markdown", data: "A private report states the total is 42." }; } };
+  const token = await signedIn(env);
+  const result = await worker.fetch(uploadRequest(token, "brief.pdf", "application/pdf", new Uint8Array([37, 80, 68, 70]), "Summarize the document"), env);
+  const data = await result.json();
+  assert.equal(result.status, 200);
+  assert.equal(data.mime_type, "application/pdf");
+  assert.match(data.text, /total is 42/);
+  assert.equal(converted.length, 1);
+  assert.equal(converted[0].name, "brief.pdf");
+  assert.equal(env.CONFIG.values.has("whatsapp:history:undefined"), false);
+  assert.equal([...env.CONFIG.values.values()].some((value) => String(value).includes("total is 42")), false);
+});
+
+test("website attachment analysis uses vision and speech models", async () => {
+  const env = makeEnv();
+  const calls = [];
+  env.AI = { async run(model, input) { calls.push({ model, input }); return model.includes("moondream") ? { response: "A bicycle beside a red wall." } : { text: "Turn left at the next street." }; } };
+  const token = await signedIn(env);
+  const image = await worker.fetch(uploadRequest(token, "street.png", "image/png", new Uint8Array([1, 2, 3]), "What is in the scene?"), env);
+  const audio = await worker.fetch(uploadRequest(token, "directions.mp3", "audio/mpeg", new Uint8Array([4, 5, 6])), env);
+  assert.match((await image.json()).text, /bicycle beside a red wall/);
+  assert.match((await audio.json()).text, /Turn left at the next street/);
+  assert.match(calls[0].model, /moondream/);
+  assert.match(calls[0].input.image, /^data:image\/png;base64,/);
+  assert.equal(calls[0].input.question.includes("What is in the scene?"), true);
+  assert.match(calls[1].model, /whisper-large-v3-turbo/);
+  assert.equal(calls[1].input.task, "transcribe");
+});
+
+test("file and frame analysis is capped per client IP per hour", async () => {
+  const env = makeEnv();
+  env.AI = { async toMarkdown() { return { format: "markdown", data: "ok" }; } };
+  const token = await signedIn(env);
+  let last;
+  for (let index = 0; index < 31; index++) last = await worker.fetch(uploadRequest(token, "brief.pdf", "application/pdf", "x"), env);
+  assert.equal(last.status, 429);
+  assert.match((await last.json()).error, /hourly file-analysis limit/);
 });
 
 test("WhatsApp can list owned GitHub repositories", async () => {
@@ -214,6 +299,26 @@ test("WhatsApp research fetches source pages and includes citations", async () =
   assert.match(sentMessages[0].text.body, /Sources:/);
   assert.match(sentMessages[0].text.body, /https:\/\/news\.example\.org\/story/);
   assert.match(searchQueries[0], /agency latest news after:/);
+});
+
+test("WhatsApp can analyze an incoming image without persisting its analysis", async () => {
+  const aiCalls = [];
+  const env = makeWhatsAppEnv({ async run(model, input) { aiCalls.push({ model, input }); return model.includes("moondream") ? { response: "A red kite flying above a park." } : { response: "Image summary delivered." }; } });
+  const mediaUrl = "https://lookaside.fbsbx.com/wa/image-1";
+  const web = {
+    incomingMedia: { image1: { url: mediaUrl, filename: "kite.png", mime_type: "image/png", file_size: 4 } },
+    incomingFiles: { [mediaUrl]: new Response(new Uint8Array([1, 2, 3, 4]), { headers: { "content-type": "image/png" } }) },
+  };
+  const { sentMessages } = installWhatsAppMock([[{ id: "wa-image", from: "user:creator", image: { id: "image1", mime_type: "image/png", caption: "What is shown?" } }]], web);
+
+  await runWhatsAppSchedule(env);
+
+  assert.equal(aiCalls.length, 2);
+  assert.match(aiCalls[0].model, /moondream/);
+  assert.match(aiCalls[1].input.messages[1].content, /red kite flying above a park/);
+  assert.match(sentMessages[0].text.body, /Image summary delivered/);
+  const savedHistory = [...env.CONFIG.values.entries()].find(([key]) => key.startsWith("whatsapp:history:"))[1];
+  assert.doesNotMatch(savedHistory, /red kite flying above a park/);
 });
 
 test("WhatsApp can create and attach a source-linked research report", async () => {
