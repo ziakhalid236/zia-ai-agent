@@ -93,6 +93,8 @@ The existing live service is managed by its current Cloudflare account. Deployin
 
 The service exposes a non-streaming OpenAI-compatible endpoint:
 
+Website chat and WhatsApp share the main operator profile. Requests authenticated with project API keys use a separate profile, configurable in the control room under **API → Separate API AI Profile**. On its first API request, the separate profile copies the current main settings to preserve existing behavior; later changes to either profile do not affect the other. Both profiles use the same Cloudflare Workers AI binding and model catalog.
+
 ```text
 POST /v1/chat/completions
 Authorization: Bearer <project API key>
@@ -105,10 +107,19 @@ Content-Type: application/json
 
 Health check: `GET /api/health`. Search: `GET /api/search?q=...` when enabled in the control room. Project keys are limited to chat, search, and health; they cannot change settings or create/revoke keys. Streaming is not enabled.
 
+## GitHub controls
+
+The control room's **GitHub** panel can list repositories owned by the token's account, create private repositories, load or commit text files up to 96 KiB, and dispatch an existing GitHub Actions workflow. Each write or workflow dispatch asks for confirmation in the browser. These endpoints require a signed control-room session; the master API token, project API keys, and WhatsApp bridge cannot use them. The Worker never returns the GitHub token to the browser.
+
+Set `GITHUB_TOKEN` as a Cloudflare Worker secret. Use a fine-grained personal access token, not a token committed to a repository. The token needs repository metadata read, contents read/write, and Actions/workflow write permissions. Repository creation requires the GitHub `Repository creation` write permission when offered; otherwise GitHub documents `Administration` write as an alternative. `Pull requests` write is optional for the current controls. Prefer a restricted set of repositories; the token in the current live Worker is account-wide and expires after 90 days.
+
+The Deploy control only starts an existing workflow file (default: `deploy.yml`). The included manual workflow is `.github/workflows/deploy.yml`; before using it, add these GitHub Actions secrets: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CONFIG_KV_NAMESPACE_ID`. Use a Cloudflare token scoped to the account's Worker deployment needs. The workflow generates `wrangler.jsonc` only during the run, so account identifiers are not committed. Do not commit `wrangler.jsonc`, API tokens, WhatsApp keys, or other secrets.
+
 ## Tests and contributor notes
 
 ```sh
 node --check worker-zia.js
+node --test worker-zia.test.mjs
 python -m py_compile termux_agent.py zia_whatsapp_agent.py
 ```
 
