@@ -1,3 +1,18 @@
+import {
+  formatResearchReply,
+  handleWhatsAppMediaRequest,
+  isMediaDownloadRequest,
+  isReportFileRequest,
+  isResearchRequest,
+  makeResearchReport,
+  researchPrompt,
+  researchUnavailableMessage,
+  researchWeb,
+  searchWeb,
+  sendWhatsAppMedia,
+  sendWhatsAppText,
+} from "./worker-zia-tools.js";
+
 const MODEL_OPTIONS = [
   { id: "@cf/google/gemma-4-26b-a4b-it", name: "Gemma 4 26B A4B" },
   { id: "@cf/zai-org/glm-4.7-flash", name: "GLM 4.7 Flash" },
@@ -222,7 +237,7 @@ const LIVE_PAGE = PAGE
   )
   .replace(
     "Polling runs once per minute; delivery can take up to about a minute.</p><p>Keep exactly one poller",
-    "Polling runs once per minute; delivery can take up to about a minute.</p><p>Text and voice notes are supported. Voice notes are downloaded from WhatsApp and transcribed by Cloudflare Workers AI before Zia replies with text.</p><p>Keep exactly one poller"
+    "Polling runs once per minute; delivery can take up to about a minute.</p><p>Text and voice notes are supported. Voice notes are downloaded from WhatsApp and transcribed by Cloudflare Workers AI before Zia replies with text.</p><p>Research requests search the public web, fetch readable source pages, and include citations. If pages cannot be verified, Zia says so rather than treating search snippets as facts. Research page text is sent to Cloudflare Workers AI.</p><p>The Worker can attach source-linked plain-text (.txt) reports and send directly downloadable public HTTPS images, audio, video, and documents. It does not bypass sign-ins, paywalls, or DRM; use only files you are allowed to copy and share. If search discovers media, Zia first asks you to confirm copying/sharing rights. The Worker caps downloads at 15 MB (5 MB for images); WhatsApp allows 16 MB for video/audio/documents and 5 MB for images. Video is not converted and must meet WhatsApp codec requirements. Incoming images, documents, and videos cannot yet be analyzed.</p><p>Keep exactly one poller"
   )
   .replace("</section></div></section></main>", "</section>" + GITHUB_PANEL.replace("WhatsApp and project API keys cannot use these controls.", "Project API keys cannot use GitHub. WhatsApp supports repository listing and confirmed private creation; file edits and workflow runs stay in this signed-in panel.") + "</div></section></div></section></main>")
   .replace("</body>", GITHUB_SCRIPT + "</body>")
@@ -426,7 +441,9 @@ async function whatsappRequest(url, token, payload) {
     if (response.status === 403) throw new Error(url.includes("/messages") ? "WhatsApp rejected the recipient (HTTP 403); the Agent can only reply to its creator" : "WhatsApp denied access to this Agent key (HTTP 403)");
     if (url.includes("/media/") && (response.status === 400 || response.status === 404)) throw new UnusableWhatsAppAudio("WhatsApp voice-note media has expired or is unavailable");
     if (response.status === 429) throw new Error("WhatsApp rate limit reached; the next scheduled poll will retry");
-    throw new Error("WhatsApp " + (url.includes("/updates") ? "poll" : "send") + " failed (HTTP " + response.status + ")");
+    const error = new Error("WhatsApp " + (url.includes("/updates") ? "poll" : "send") + " failed (HTTP " + response.status + ")");
+    error.status = response.status;
+    throw error;
   }
   if (response.status === 204) return null;
   const raw = await response.text();
@@ -441,12 +458,13 @@ async function whatsappHistoryKey(sender) {
   return "whatsapp:history:" + Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function generateWhatsAppReply(history, config, env) {
-  const toolPolicy = "\n\nEnabled tools: internet search is " + (config.web_search_enabled ? "available through the website API only" : "disabled") + "; shell command suggestions are " + (config.shell_suggestions_enabled ? "unexecuted text only" : "disabled");
+async function generateWhatsAppReply(history, config, env, sources = []) {
+  const toolPolicy = "\n\nEnabled tools: internet search and source-page retrieval are " + (config.web_search_enabled ? "available for WhatsApp research requests" : "disabled") + "; shell command suggestions are " + (config.shell_suggestions_enabled ? "unexecuted text only" : "disabled");
   const githubPolicy = env.GITHUB_TOKEN
     ? "\nWhatsApp GitHub actions: list repositories with /github repos; stage a private repository with /github create <name>, then require the same sender to confirm using the one-time code. Only these two GitHub actions are available in WhatsApp. File edits and workflow runs require the signed-in website panel. Never claim another GitHub action was completed."
     : "\nGitHub actions are not configured in this WhatsApp bridge.";
-  const system = "Assistant name: " + config.assistant_name + ".\nOperator-defined behavior:\n" + config.instructions + toolPolicy + githubPolicy + "\n\n" + FIXED_GUARD;
+  let system = "Assistant name: " + config.assistant_name + ".\nOperator-defined behavior:\n" + config.instructions + toolPolicy + githubPolicy + "\n\n" + FIXED_GUARD;
+  if (sources.length) system += "\n\n" + researchPrompt(sources);
   const result = await env.AI.run(config.model, { messages: [{ role: "system", content: system }].concat(history), temperature: config.temperature, max_tokens: config.max_tokens });
   let answer = typeof result.response === "string" ? result.response : result.choices && result.choices[0] && result.choices[0].message ? result.choices[0].message.content : JSON.stringify(result);
   answer = stripMarkdownHeadingMarkers(answer);
@@ -585,7 +603,8 @@ async function pollWhatsApp(env) {
     let voiceNote = false;
     let audioFailed = false;
     let answer;
-    let nextHistory = null;
+    let attachment = null;
+    let history = null;
     let historyKey = null;
     if (text === null && (message.audio || message.type === "audio")) {
       try {
@@ -599,24 +618,56 @@ async function pollWhatsApp(env) {
     if (audioFailed) {
       answer = "Sorry, I couldn't transcribe that voice note. Please try again or send your message as text.";
     } else if (text === null) {
-      answer = "I can process text and voice notes right now. Please type your request or send a voice note.";
+      const kind = message.type || (message.image ? "image" : message.video ? "video" : message.document ? "document" : "media");
+      answer = "I received your " + kind + ". I can transcribe voice notes and send supported public media files, but I cannot analyze incoming images, documents, or videos yet.";
     } else {
       historyKey = await whatsappHistoryKey(recipient);
       const savedHistory = await env.CONFIG.get(historyKey, "json");
-      const history = Array.isArray(savedHistory) ? savedHistory.filter((item) => item && ["user", "assistant"].includes(item.role) && typeof item.content === "string").slice(-18) : [];
+      history = Array.isArray(savedHistory) ? savedHistory.filter((item) => item && ["user", "assistant"].includes(item.role) && typeof item.content === "string").slice(-18) : [];
       history.push({ role: "user", content: redactWhatsAppConfirmationCode(voiceNote ? "[WhatsApp voice note transcription]\n" + text : text) });
       answer = await whatsappGitHubReply(text, recipient, env);
+      if (answer === null && isMediaDownloadRequest(text)) {
+        const mediaResult = await handleWhatsAppMediaRequest(text, config);
+        answer = mediaResult.answer;
+        attachment = mediaResult.attachment;
+      }
+      const wantsReport = isReportFileRequest(text);
+      const needsResearch = isResearchRequest(text) || wantsReport;
+      if (answer === null && needsResearch) {
+        if (!config.web_search_enabled) answer = researchUnavailableMessage(config);
+        else {
+          try {
+            const research = await researchWeb(text);
+            if (!research.sources.length) answer = researchUnavailableMessage(config);
+            else {
+              const findings = await generateWhatsAppReply(history, config, env, research.sources);
+              if (wantsReport) {
+                attachment = makeResearchReport(text, findings, research.sources);
+                answer = /\b(?:csv|spreadsheet|excel|xlsx)\b/i.test(text)
+                  ? "I attached a source-linked text report. CSV and Excel spreadsheet exports are not supported yet."
+                  : "I researched this using fetched source pages and attached a source-linked text report. The references are included in the file.";
+              } else answer = formatResearchReply(findings, research.sources);
+            }
+          } catch (error) { answer = researchUnavailableMessage(config, error); }
+        }
+      }
       if (answer === null) answer = await generateWhatsAppReply(history, config, env);
-      history.push({ role: "assistant", content: redactWhatsAppConfirmationCode(answer) });
-      nextHistory = history.slice(-20);
     }
-    await whatsappRequest(WHATSAPP_API + "/messages", env.WHATSAPP_AGENT_API_KEY, {
-      messaging_product: "whatsapp",
-      to: recipient,
-      type: "text",
-      text: { body: answer },
-    });
-    if (historyKey && nextHistory) await env.CONFIG.put(historyKey, JSON.stringify(nextHistory), { expirationTtl: 86400 });
+    if (attachment) {
+      try { await sendWhatsAppMedia(recipient, attachment, answer, env, whatsappRequest); }
+      catch (error) {
+        if (error.whatsappSendAttempted && error.status !== 400) throw error;
+        answer = answer.slice(0, 2700) + (error.whatsappSendAttempted
+          ? "\n\nWhatsApp rejected this media format (HTTP 400); it may use an unsupported codec or file type."
+          : "\n\nThe file could not be uploaded to WhatsApp: " + String(error.message || "upload failed").slice(0, 180));
+        attachment = null;
+        await sendWhatsAppText(recipient, answer, env, whatsappRequest);
+      }
+    } else await sendWhatsAppText(recipient, answer, env, whatsappRequest);
+    if (historyKey && history) {
+      history.push({ role: "assistant", content: redactWhatsAppConfirmationCode(answer + (attachment ? "\n[Attachment delivered: " + attachment.filename + "]" : "")) });
+      await env.CONFIG.put(historyKey, JSON.stringify(history.slice(-20)), { expirationTtl: 86400 });
+    }
     handledSet.add(messageId);
     state.pending = state.pending.filter((item) => String(item.id) !== messageId);
     state.handled = Array.from(handledSet).slice(-500);
@@ -638,26 +689,6 @@ async function runWhatsAppSchedule(env) {
       await env.CONFIG.put(WHATSAPP_STATUS_KEY, JSON.stringify({ configured: !!env.WHATSAPP_AGENT_API_KEY, last_run_at: new Date().toISOString(), last_success_at: previous.last_success_at || null, last_error: error && error.message ? error.message.slice(0, 240) : "Poll failed", last_update_type: previous.last_update_type || null, processed: Number(previous.processed || 0), last_received: Number(previous.last_received || 0), queued: Number(previous.queued || 0) }));
     }
   }
-}
-
-function decodeHtml(value) {
-  return value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;|&#x27;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)));
-}
-
-async function searchWeb(query) {
-  const response = await fetch("https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query), { headers: { "user-agent": "Mozilla/5.0 (compatible; ZiaAI/1.0)" } });
-  if (!response.ok) throw new Error("Search provider returned " + response.status);
-  const html = await response.text();
-  const starts = [...html.matchAll(/<div class="result(?:\s|\")[^>]*>/g)];
-  return starts.slice(0, 6).map((marker, index) => {
-    const row = html.slice(marker.index, starts[index + 1] ? starts[index + 1].index : html.length);
-    const link = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/.exec(row);
-    const snippet = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>|class="result__snippet"[^>]*>([\s\S]*?)<\/td>/.exec(row);
-    if (!link) return null;
-    let target = decodeHtml(link[1]);
-    try { const parsed = new URL(target, "https://duckduckgo.com"); target = parsed.searchParams.get("uddg") || parsed.href; } catch (_) {}
-    return { title: decodeHtml(link[2].replace(/<[^>]+>/g, "").trim()), url: target, snippet: decodeHtml(((snippet && (snippet[1] || snippet[2])) || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()) };
-  }).filter((item) => item && /^https?:\/\//i.test(item.url));
 }
 
 const GITHUB_API = "https://api.github.com";
