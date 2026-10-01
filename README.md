@@ -87,6 +87,8 @@ npx wrangler deploy --config wrangler.jsonc
 
 The cloud Cron bridge handles text and voice notes. It downloads audio by the WhatsApp media ID, limits input to 8 MiB, transcribes it with Cloudflare Workers AI (`@cf/openai/whisper-large-v3-turbo`), then sends Zia's text reply. The optional local Python receiver remains text-only. Transcription usage is billed under Workers AI; the [model page](https://developers.cloudflare.com/workers-ai/models/whisper-large-v3-turbo/) currently lists $0.000513 per audio minute, subject to Cloudflare's current pricing and allowances.
 
+The cloud WhatsApp bridge can list owned GitHub repositories with `/github repos` and create a private repository with `/github create <name>`. A create request only stages the action; creation happens after the same WhatsApp sender replies with the one-time confirmation code, which expires after 10 minutes. `/github cancel` cancels a pending creation. This is available only in the cloud Worker bridge, not the optional local Python receiver. File edits and workflow runs remain in the signed-in website GitHub panel. WhatsApp Agent conversations are not end-to-end encrypted; do not send secrets or sensitive data through WhatsApp.
+
 The existing live service is managed by its current Cloudflare account. Deploying a new Worker requires your own account's binding IDs and secrets; source code alone cannot transfer account ownership or credentials.
 
 ## API
@@ -109,7 +111,7 @@ Health check: `GET /api/health`. Search: `GET /api/search?q=...` when enabled in
 
 ## GitHub controls
 
-The control room's **GitHub** panel can list repositories owned by the token's account, create private repositories, load or commit text files up to 96 KiB, and dispatch an existing GitHub Actions workflow. Each write or workflow dispatch asks for confirmation in the browser. These endpoints require a signed control-room session; the master API token, project API keys, and WhatsApp bridge cannot use them. The Worker never returns the GitHub token to the browser.
+The control room's **GitHub** panel can list repositories owned by the token's account, create private repositories, load or commit text files up to 96 KiB, and dispatch an existing GitHub Actions workflow. Each write or workflow dispatch asks for confirmation in the browser. These website endpoints require a signed control-room session; the master API token and project API keys cannot use GitHub. The cloud WhatsApp bridge has a separate, limited path for repository listing and same-chat-confirmed private repository creation. The Worker never returns the GitHub token to the browser.
 
 Set `GITHUB_TOKEN` as a Cloudflare Worker secret. Use a fine-grained personal access token, not a token committed to a repository. The token needs repository metadata read, contents read/write, and Actions/workflow write permissions. Repository creation requires the GitHub `Repository creation` write permission when offered; otherwise GitHub documents `Administration` write as an alternative. `Pull requests` write is optional for the current controls. Prefer a restricted set of repositories; the token in the current live Worker is account-wide and expires after 90 days.
 
