@@ -200,6 +200,38 @@ test("WhatsApp small talk uses brief Zoya companion style without research", asy
   assert.match(sentMessages[0].text.body, /تمہارا دن/);
 });
 
+test("WhatsApp retries null model output and never sends null as a reply", async () => {
+  let aiCalls = 0;
+  const env = makeWhatsAppEnv({ async run() {
+    aiCalls++;
+    return aiCalls < 3 ? { response: "null" } : { response: "I'm glad you messaged. How's your day going?" };
+  } });
+  const { sentMessages } = installWhatsAppMock([[
+    { id: "wa-null-fallback", from: "user:creator", text: "Hi" },
+    { id: "wa-null-retry", from: "user:creator", text: "How are you?" },
+  ]]);
+
+  await runWhatsAppSchedule(env);
+
+  assert.equal(aiCalls, 3);
+  assert.match(sentMessages[0].text.body, /small hiccup/i);
+  assert.match(sentMessages[1].text.body, /glad you messaged/i);
+  assert.ok(sentMessages.every((message) => message.text.body !== "null"));
+});
+
+test("website chat retries null model output before returning a reply", async () => {
+  const env = makeEnv();
+  let aiCalls = 0;
+  env.AI = { async run() { aiCalls++; return aiCalls === 1 ? { response: "null" } : { response: "Hello, I'm glad you stopped by." }; } };
+  const token = await signedIn(env);
+  const result = await worker.fetch(request("/api/chat", token, "POST", { messages: [{ role: "user", content: "Hi" }] }), env);
+  const data = await result.json();
+
+  assert.equal(result.status, 200);
+  assert.equal(aiCalls, 2);
+  assert.match(data.choices[0].message.content, /glad you stopped by/i);
+});
+
 test("website chat automatically reads and cites a shared public page", async () => {
   const env = makeEnv();
   const aiCalls = [];
