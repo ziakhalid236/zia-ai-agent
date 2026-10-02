@@ -67,14 +67,21 @@ function uploadRequest(token, name, mimeType, bytes, prompt = "") {
 
 async function runWhatsAppSchedule(env) {
   let scheduled;
-  worker.scheduled({}, env, { waitUntil(promise) { scheduled = promise; } });
+  await worker.scheduled({}, env, { waitUntil(promise) { scheduled = promise; } });
   await scheduled;
+}
+
+async function runScheduledEvent(env) {
+  let scheduled;
+  await worker.scheduled({}, env, { waitUntil(promise) { scheduled = promise; } });
+  if (scheduled) await scheduled;
 }
 
 function installWhatsAppMock(batches, web = {}) {
   const githubCalls = installGitHubMock();
   const githubFetch = globalThis.fetch;
   const sentMessages = [];
+  const sentStatuses = [];
   const uploadedMedia = [];
   const searchQueries = [];
   let poll = 0;
@@ -84,6 +91,10 @@ function installWhatsAppMock(batches, web = {}) {
       const messages = batches[poll] || [];
       poll++;
       return response({ messages, next_offset: String(poll) });
+    }
+    if (url.origin === "https://api.whatsapp.com" && url.pathname.endsWith("/statuses")) {
+      sentStatuses.push(JSON.parse(options.body));
+      return response({ success: true });
     }
     if (url.origin === "https://api.whatsapp.com" && url.pathname.includes("/media/") && options.method !== "POST") {
       const id = decodeURIComponent(url.pathname.split("/").pop());
@@ -110,7 +121,7 @@ function installWhatsAppMock(batches, web = {}) {
     if (web.files && Object.hasOwn(web.files, url.href)) return web.files[url.href];
     return githubFetch(input, options);
   };
-  return { githubCalls, sentMessages, uploadedMedia, searchQueries };
+  return { githubCalls, sentMessages, sentStatuses, uploadedMedia, searchQueries, pollCount: () => poll };
 }
 
 function makeWhatsAppEnv(ai) {
@@ -159,6 +170,8 @@ test("control room renders a separate GitHub panel", async () => {
   assert.match(html, /fetch readable source pages, and include citations/);
   assert.match(html, /source-linked plain-text \(\.txt\) reports/);
   assert.match(html, /id="attachButton"/);
+  assert.match(html, /id="whatsappMode"/);
+  assert.match(html, /id="saveWhatsAppMode"/);
   assert.match(html, /sampled frames, no audio analysis/);
   assert.match(html, /Sign in to Zoya/);
   assert.match(html, /richMessage/);
@@ -181,54 +194,93 @@ test("migrates the saved default assistant name and instructions to Zoya", async
   assert.match(config.instructions, /without unnecessary refusal/);
 });
 
+test("receiver mode can only be changed from a signed-in control room", async () => {
+  const env = makeEnv();
+  const token = await signedIn(env);
+
+  const initial = await worker.fetch(request("/api/whatsapp/mode", token), env);
+  assert.deepEqual(await initial.json(), { mode: "cloud" });
+  const changed = await worker.fetch(request("/api/whatsapp/mode", token, "PUT", { mode: "local" }), env);
+  assert.deepEqual(await changed.json(), { mode: "local" });
+  const invalid = await worker.fetch(request("/api/whatsapp/mode", token, "PUT", { mode: "other" }), env);
+  assert.equal(invalid.status, 400);
+  const apiKeyChange = await worker.fetch(request("/api/whatsapp/mode", API_TOKEN, "PUT", { mode: "cloud" }), env);
+  assert.equal(apiKeyChange.status, 403);
+});
+
+test("Cloud scheduled receiver skips WhatsApp polling in local fast mode", async () => {
+  const env = makeWhatsAppEnv();
+  await env.CONFIG.put("whatsapp:mode", "local");
+  const { pollCount } = installWhatsAppMock([[]]);
+
+  await runScheduledEvent(env);
+
+  assert.equal(pollCount(), 0);
+});
+
 test("WhatsApp small talk uses brief Zoya companion style without research", async () => {
   const aiCalls = [];
   const env = makeWhatsAppEnv({ async run(_model, input) { aiCalls.push(input); return { response: "اچھا، تمہارا دن کیسا جا رہا ہے؟" }; } });
   await env.CONFIG.put("config", JSON.stringify({ assistant_name: "Zia", instructions: LEGACY_DEFAULT_INSTRUCTIONS }));
-  const { sentMessages, searchQueries } = installWhatsAppMock([[{ id: "wa-small-talk", from: "user:creator", text: "کیسا دن جا رہا ہے؟" }]]);
+  const { sentMessages, sentStatuses, searchQueries } = installWhatsAppMock([[{ id: "wa-small-talk", from: "user:creator", text: "کیسا دن جا رہا ہے؟" }]]);
 
   await runWhatsAppSchedule(env);
 
   assert.equal(aiCalls.length, 1);
+  assert.equal(aiCalls[0].chat_template_kwargs.enable_thinking, false);
   assert.match(aiCalls[0].messages[0].content, /Assistant name: Zoya/);
-  assert.match(aiCalls[0].messages[0].content, /adult feminine AI companion voice/);
-  assert.match(aiCalls[0].messages[0].content, /1-3 short sentences/);
+  assert.match(aiCalls[0].messages[0].content, /speak as an adult feminine AI companion/);
+  assert.match(aiCalls[0].messages[0].content, /Never call the user بھائی/);
+  assert.match(aiCalls[0].messages[0].content, /informal 'تم'/);
+  assert.match(aiCalls[0].messages[0].content, /1-3 natural sentences/);
   assert.match(aiCalls[0].messages[0].content, /do not search the web for everyday chat/);
   assert.equal(aiCalls[0].max_tokens, 260);
   assert.ok(aiCalls[0].temperature >= 0.6);
   assert.equal(searchQueries.length, 0);
   assert.match(sentMessages[0].text.body, /تمہارا دن/);
+  assert.deepEqual(sentStatuses[0], { messaging_product: "whatsapp", status: "read", message_id: "wa-small-talk", typing_indicator: { type: "text" } });
 });
 
-test("WhatsApp retries null model output and never sends null as a reply", async () => {
-  let aiCalls = 0;
-  const env = makeWhatsAppEnv({ async run() {
-    aiCalls++;
-    return aiCalls < 3 ? { response: "null" } : { response: "I'm glad you messaged. How's your day going?" };
+test("WhatsApp falls back to a second model when the configured model returns null", async () => {
+  const aiCalls = [];
+  const env = makeWhatsAppEnv({ async run(model, input) {
+    aiCalls.push({ model, input });
+    return model === "@cf/zai-org/glm-4.7-flash" ? { response: "I'm glad you messaged. How's your day going?" } : { response: "null" };
   } });
   const { sentMessages } = installWhatsAppMock([[
     { id: "wa-null-fallback", from: "user:creator", text: "Hi" },
-    { id: "wa-null-retry", from: "user:creator", text: "How are you?" },
   ]]);
 
   await runWhatsAppSchedule(env);
 
-  assert.equal(aiCalls, 3);
-  assert.match(sentMessages[0].text.body, /small hiccup/i);
-  assert.match(sentMessages[1].text.body, /glad you messaged/i);
+  assert.deepEqual(aiCalls.map((call) => call.model), ["@cf/google/gemma-4-26b-a4b-it", "@cf/google/gemma-4-26b-a4b-it", "@cf/zai-org/glm-4.7-flash"]);
+  assert.ok(aiCalls.slice(0, 2).every((call) => call.input.chat_template_kwargs.enable_thinking === false));
+  assert.match(sentMessages[0].text.body, /glad you messaged/i);
   assert.ok(sentMessages.every((message) => message.text.body !== "null"));
+});
+
+test("WhatsApp uses a natural fallback if every model returns an empty reply", async () => {
+  const env = makeWhatsAppEnv({ async run() { return { response: "null" }; } });
+  const { sentMessages } = installWhatsAppMock([[{ id: "wa-final-fallback", from: "user:creator", text: "سلام" }]]);
+
+  await runWhatsAppSchedule(env);
+
+  assert.match(sentMessages[0].text.body, /تمہارا پیغام مل گیا ہے/);
+  assert.doesNotMatch(sentMessages[0].text.body, /small hiccup|Sorry, I hit/i);
 });
 
 test("website chat retries null model output before returning a reply", async () => {
   const env = makeEnv();
   let aiCalls = 0;
-  env.AI = { async run() { aiCalls++; return aiCalls === 1 ? { response: "null" } : { response: "Hello, I'm glad you stopped by." }; } };
+  const aiInputs = [];
+  env.AI = { async run(_model, input) { aiCalls++; aiInputs.push(input); return aiCalls === 1 ? { response: "null" } : { response: "Hello, I'm glad you stopped by." }; } };
   const token = await signedIn(env);
   const result = await worker.fetch(request("/api/chat", token, "POST", { messages: [{ role: "user", content: "Hi" }] }), env);
   const data = await result.json();
 
   assert.equal(result.status, 200);
   assert.equal(aiCalls, 2);
+  assert.equal(aiInputs[0].chat_template_kwargs.enable_thinking, false);
   assert.match(data.choices[0].message.content, /glad you stopped by/i);
 });
 
