@@ -14,6 +14,7 @@ import {
   sendWhatsAppMedia,
   sendWhatsAppText,
 } from "./worker-zia-tools.js";
+import { fatwaAgentStatus, runFatwaAgentCycle } from "./fatwa-agent.js";
 
 const MODEL_OPTIONS = [
   { id: "@cf/google/gemma-4-26b-a4b-it", name: "Gemma 4 26B A4B" },
@@ -1178,6 +1179,10 @@ export default {
         const state = env.CONFIG ? await env.CONFIG.get(WHATSAPP_STATE_KEY, "json") || {} : {};
         return json({ configured: !!env.WHATSAPP_AGENT_API_KEY, mode: await getWhatsAppMode(env), last_run_at: status.last_run_at || null, last_success_at: status.last_success_at || null, last_error: status.last_error || null, last_update_type: status.last_update_type || null, processed: Number(status.processed || 0), last_received: Number(status.last_received || 0), queued: Array.isArray(state.pending) ? state.pending.length : 0, has_offset: state.offset !== null && state.offset !== undefined });
       }
+      if (url.pathname === "/api/fatwa-agent/status" && request.method === "GET") {
+        if (!siteSession) return json({ error: "Signed control-room session required" }, 403);
+        return json(await fatwaAgentStatus(env));
+      }
       if (url.pathname === "/api/config" && request.method === "GET") return json(Object.assign(await loadConfig(env), { models: MODEL_OPTIONS }));
       if (url.pathname === "/api/api-config" && request.method === "GET") return json(Object.assign(await loadConfig(env, "api_config"), { models: MODEL_OPTIONS }));
       if ((url.pathname === "/api/config" || url.pathname === "/api/api-config") && request.method === "PUT") {
@@ -1232,7 +1237,8 @@ export default {
     }
   },
   async scheduled(_controller, env, ctx) {
-    if (await getWhatsAppMode(env) === "local") return;
-    ctx.waitUntil(runWhatsAppSchedule(env));
+    const tasks = [runFatwaAgentCycle(env, { runner: runTextModel, model: DEFAULT_CONFIG.model })];
+    if (await getWhatsAppMode(env) !== "local") tasks.push(runWhatsAppSchedule(env));
+    ctx.waitUntil(Promise.allSettled(tasks));
   },
 };

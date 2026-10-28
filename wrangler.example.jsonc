@@ -4,6 +4,9 @@
   "main": "worker-zia.js",
   "compatibility_date": "2026-09-30",
   "ai": { "binding": "AI" },
+  "d1_databases": [
+    { "binding": "FATWA_DB", "database_name": "fatwa-web-content", "database_id": "REPLACE_WITH_FATWA_D1_ID" }
+  ],
   "triggers": { "crons": ["*/1 * * * *"] },
   "kv_namespaces": [
     { "binding": "CONFIG", "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }

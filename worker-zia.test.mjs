@@ -5,8 +5,12 @@ import { Script } from "node:vm";
 
 const source = await readFile(new URL("./worker-zia.js", import.meta.url), "utf8");
 const toolSource = await readFile(new URL("./worker-zia-tools.js", import.meta.url), "utf8");
+const fatwaAgentSource = await readFile(new URL("./fatwa-agent.js", import.meta.url), "utf8");
 const toolsModule = "data:text/javascript;base64," + Buffer.from(toolSource).toString("base64");
-const bundledSource = source.replace('from "./worker-zia-tools.js";', "from \"" + toolsModule + "\";");
+const fatwaAgentModule = "data:text/javascript;base64," + Buffer.from(fatwaAgentSource).toString("base64");
+const bundledSource = source
+  .replace('from "./worker-zia-tools.js";', "from \"" + toolsModule + "\";")
+  .replace('from "./fatwa-agent.js";', "from \"" + fatwaAgentModule + "\";");
 const { default: worker } = await import("data:text/javascript;base64," + Buffer.from(bundledSource).toString("base64"));
 const { isResearchRequest } = await import(toolsModule);
 const API_TOKEN = "a".repeat(48);
