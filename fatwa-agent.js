@@ -6,7 +6,7 @@ const ALLOWED_SOURCES = [
     institution: "Darul Ifta, Darul Uloom Deoband",
     host: "darulifta-deoband.com",
     indexUrl: "https://darulifta-deoband.com/en",
-    pathPrefix: "/home/en/",
+    pathPrefix: "/en",
   },
   {
     institution: "Jamia Darul Uloom Karachi",
