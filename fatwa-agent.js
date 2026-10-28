@@ -145,3 +145,28 @@ export async function fatwaAgentStatus(env) {
   ]);
   return { enabled: true, mode: "draft-only", lastRun: run || null, candidates: candidates.results || [], sources: sources.results || [] };
 }
+
+export async function fatwaAgentAdmin(env, id, action) {
+  if (!env.FATWA_DB) throw new Error("FATWA_DB is not configured");
+  const candidate = await env.FATWA_DB.prepare(`SELECT * FROM fatwa_agent_candidates WHERE id=?`).bind(id).first();
+  if (!candidate) return { error: "Candidate not found", status: 404 };
+  if (action === "approve") {
+    if (!candidate.question || !candidate.answer || !candidate.category || !candidate.institution || !candidate.source_url) return { error: "Candidate is incomplete and cannot be published", status: 400 };
+    const timestamp = now();
+    const fatwaId = `fatwa-agent-${crypto.randomUUID()}`;
+    await env.FATWA_DB.batch([
+      env.FATWA_DB.prepare(`INSERT INTO fatwas (id,question,answer,category,scholar,institution,source_url,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`).bind(fatwaId, candidate.question, candidate.urdu_draft || candidate.answer, candidate.category, candidate.scholar || "Source institution", candidate.institution, candidate.source_url, "published", timestamp, timestamp),
+      env.FATWA_DB.prepare(`UPDATE fatwa_agent_candidates SET status='approved',updated_at=? WHERE id=?`).bind(timestamp, id),
+    ]);
+    return { ok: true, status: "approved", fatwaId };
+  }
+  if (action === "reject") {
+    await env.FATWA_DB.prepare(`UPDATE fatwa_agent_candidates SET status='rejected',updated_at=? WHERE id=?`).bind(now(), id).run();
+    return { ok: true, status: "rejected" };
+  }
+  if (action === "delete") {
+    await env.FATWA_DB.prepare(`DELETE FROM fatwa_agent_candidates WHERE id=?`).bind(id).run();
+    return { ok: true, status: "deleted" };
+  }
+  return { error: "action must be approve, reject, or delete", status: 400 };
+}

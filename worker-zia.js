@@ -14,7 +14,7 @@ import {
   sendWhatsAppMedia,
   sendWhatsAppText,
 } from "./worker-zia-tools.js";
-import { fatwaAgentStatus, runFatwaAgentCycle } from "./fatwa-agent.js";
+import { fatwaAgentAdmin, fatwaAgentStatus, runFatwaAgentCycle } from "./fatwa-agent.js";
 
 const MODEL_OPTIONS = [
   { id: "@cf/google/gemma-4-26b-a4b-it", name: "Gemma 4 26B A4B" },
@@ -1182,6 +1182,15 @@ export default {
       if (url.pathname === "/api/fatwa-agent/status" && request.method === "GET") {
         if (!siteSession) return json({ error: "Signed control-room session required" }, 403);
         return json(await fatwaAgentStatus(env));
+      }
+      if (url.pathname.startsWith("/api/fatwa-agent/admin") && ["GET", "PATCH", "DELETE"].includes(request.method)) {
+        const internalToken = request.headers.get("x-agent-token") || "";
+        if (!env.FATWA_AGENT_ADMIN_TOKEN || internalToken !== env.FATWA_AGENT_ADMIN_TOKEN) return json({ error: "Fatwa agent admin authentication required" }, 401);
+        if (request.method === "GET") return json(await fatwaAgentStatus(env));
+        const id = decodeURIComponent(url.pathname.split("/").pop() || "");
+        const action = request.method === "DELETE" ? "delete" : (await request.json()).action;
+        const result = await fatwaAgentAdmin(env, id, action);
+        return json(result, result.status || 200);
       }
       if (url.pathname === "/api/config" && request.method === "GET") return json(Object.assign(await loadConfig(env), { models: MODEL_OPTIONS }));
       if (url.pathname === "/api/api-config" && request.method === "GET") return json(Object.assign(await loadConfig(env, "api_config"), { models: MODEL_OPTIONS }));
