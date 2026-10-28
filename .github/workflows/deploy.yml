@@ -25,6 +25,7 @@ jobs:
             main: 'worker-zia.js',
             compatibility_date: '2026-09-30',
             ai: { binding: 'AI' },
+            d1_databases: [{ binding: 'FATWA_DB', database_name: 'fatwa-web-content', database_id: 'c07cb62b-83d3-48b3-a84f-f7959b134005' }],
             triggers: { crons: ['*/1 * * * *'] },
             kv_namespaces: [{ binding: 'CONFIG', id: namespaceId }],
           }, null, 2));
